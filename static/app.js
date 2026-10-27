@@ -14,12 +14,16 @@ const DEF_ROOFS = [{ panels: QUOTE_PANELS, max: QUOTE_PANELS, az: 50, side: 'W',
   { panels: 0, max: 20, az: 130, side: 'E', tilt: 37, shade: 0.85, kk: 600 }];
 const compass = (az, side) => ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round((((180 + (side === 'W' ? az : -az)) % 360) + 360) % 360 / 45) % 8];
 const DEF = { panelW: 455, panelPrice: 400, annual: 4359, panels: QUOTE_PANELS, exportRate: 12, battery: 9.73, cost: 11497, lat: 52, lon: -1.5,
-  evThr: 1.4, peak: 34.27, offpeak: 6.6, standing: 50.75, gridCharge: 'winter', batExport: 'summer', batKw: 5, batEff: 94, batModel: 'evo10', deg: 0.4, escal: 0, term: 10, apr: 4.9, batDeg: 2, trend: 'h2', exportEscal: 0 };
+  evThr: 1.4, peak: 34.27, offpeak: 6.6, standing: 50.75, gridCharge: 'winter', batExport: 'summer', batKw: 5, batKwCharge: 5, batEff: 94, batModel: 'evo10', deg: 0.4, escal: 0, term: 10, apr: 4.9, batDeg: 2, trend: 'h2', exportEscal: 0 };
 // Fox ESS datasheets: usable = nominal kWh x 95% depth of discharge; round trip = PV->battery x battery->AC efficiency
 // (EVO 5: 95.4% x 94.5% = 90%; EVO 10: 97.3% x 96.4% = 94%). The EVO 5 ships with the 3.68 kW inverter, the EVO 10 with 5 kW.
 const PRODUCTS = {
-  evo5: { name: 'Fox EVO 5', battery: 4.86, batKw: 3.68, batEff: 90, cost: 10109 }, // system prices quoted by the user
-  evo10: { name: 'Fox EVO 10', battery: 9.73, batKw: 5, batEff: 94, cost: 11497 },
+  // warrMWh: Fox ESS UK battery warranty v4.5 keeps >=70% of nominal capacity for 12 years or until this energy throughput.
+  evo5: { name: 'Fox EVO 5', battery: 4.86, batKw: 3.68, batEff: 90, cost: 10109, warrMWh: 23.99 }, // system prices quoted by the user
+  evo10: { name: 'Fox EVO 10', battery: 9.73, batKw: 5, batEff: 94, cost: 11497, warrMWh: 47.88 },
+  // Tesla Powerwall 3 (datasheet): 13.5 kWh, up to 11.04 kW AC output but charging is limited to 5 kW; 89% solar->battery->home
+  // efficiency; 10-year warranty (the datasheet gives no throughput limit). Price quoted by the user, incl. the 11.04 kW inverter.
+  pw3: { name: 'Tesla Powerwall 3', battery: 13.5, batKw: 11.04, batKwCharge: 5, batEff: 89, cost: 14160, warrMWh: null },
 };
 function loadCfg() {
   const saved = JSON.parse(localStorage.getItem('octo.cfg') || '{}'), cfg = Object.assign({}, DEF, saved);
@@ -235,10 +239,10 @@ function compute() {
     } }
   // mode: 'off' = solar-charged battery only, 'winter' / 'all' = also charge from the grid off-peak.
   // expMode: 'summer' / 'all' = fill the battery off-peak and sell what home use won't need back at the export rate.
-  return (cap, mode, expMode = 'off', kw = c.batKw, effPct = c.batEff) => {
+  return (cap, mode, expMode = 'off', kw = c.batKw, effPct = c.batEff, kwC = c.batKwCharge) => {
     const r = { self: new Float64Array(n), direct: new Float64Array(n), bg: new Float64Array(n), exp: new Float64Array(n),
       imp: new Float64Array(n), gch: new Float64Array(n), bx: new Float64Array(n) };
-    const maxSlot = kw / 2, eff = Math.sqrt(effPct / 100), canExport = arbOK(effPct); let socS = 0, socG = 0;
+    const maxSlot = kw / 2, maxC = Math.min(kwC, kw) / 2, eff = Math.sqrt(effPct / 100), canExport = arbOK(effPct); let socS = 0, socG = 0;
     const drain = (take) => { const tot = socS + socG, shG = tot ? socG / tot : 0; socG -= take * shG; socS -= take * (1 - shG); return shG; };
     for (let i = 0; i < n; i++) {
       const dh = Math.min(gs[i], load[i]); let surplus = gs[i] - dh, delS = 0, delG = 0, chgG = 0, ex = 0;
@@ -247,12 +251,12 @@ function compute() {
         const expOn = canExport && (expMode === 'all' || (expMode === 'summer' && SUMMER[m]));
         // surplus solar tops the battery up (only as far as later home use needs while exporting)
         const limit = expOn ? Math.min(cap, rem[i] / eff) : cap;
-        const chg = Math.max(0, Math.min(surplus, (limit - socS - socG) / eff, maxSlot));
+        const chg = Math.max(0, Math.min(surplus, (limit - socS - socG) / eff, maxC));
         socS += chg * eff; surplus -= chg;
         // cheap-rate grid charging
-        if (tou && off[i] && (expOn || mode === 'all' || (mode === 'winter' && WINTER[m]))) {
-          const want = expOn ? cap : Math.min(cap, tgt[i] / eff), have = socS + socG;
-          if (have < want) { chgG = Math.min((want - have) / eff, maxSlot); socG += chgG * eff; }
+        if (tou && off[i] && (expOn || mode === 'all' || mode === 'full' || (mode === 'winter' && WINTER[m]))) {
+          const want = expOn || mode === 'full' ? cap : Math.min(cap, tgt[i] / eff), have = socS + socG;
+          if (have < want) { chgG = Math.min((want - have) / eff, maxC); socG += chgG * eff; }
         }
         if (!tou || !off[i]) {
           // cover household load, then sell what is left above the reserve
@@ -279,12 +283,18 @@ function compute() {
   const sum1 = a => a.reduce((x, y) => x + y, 0);
   // compare the two real products (each with its own inverter and efficiency), plus any custom setup
   const base = saving(sim(0, 'off'));
-  const options = Object.values(PRODUCTS).map(p => ({ name: `${p.name} (${nf(p.battery, 1)} kWh, ${p.batKw} kW)`, short: p.name, cap: p.battery, kw: p.batKw, eff: p.batEff, price: p.cost + (c.panels - QUOTE_PANELS) * c.panelPrice }));
-  if (c.batModel === 'custom' && c.battery > 0) options.push({ name: `Custom (${nf(c.battery, 1)} kWh, ${c.batKw} kW)`, short: 'Custom', cap: c.battery, kw: c.batKw, eff: c.batEff, price: +c.cost || 0 });
+  const options = Object.values(PRODUCTS).map(p => ({ name: `${p.name} (${nf(p.battery, 1)} kWh, ${p.batKw} kW)`, short: p.name, cap: p.battery, kw: p.batKw, eff: p.batEff, kwC: p.batKwCharge || p.batKw, warrMWh: p.warrMWh, price: p.cost + (c.panels - QUOTE_PANELS) * c.panelPrice }));
+  if (c.batModel === 'custom' && c.battery > 0) options.push({ name: `Custom (${nf(c.battery, 1)} kWh, ${c.batKw} kW)`, short: 'Custom', cap: c.battery, kw: c.batKw, kwC: c.batKwCharge, eff: c.batEff, price: +c.cost || 0 });
   const scen = options.map(o => {
-    const run = (mode, ex) => sim(o.cap, mode, ex, o.kw, o.eff);
+    const run = (mode, ex) => sim(o.cap, mode, ex, o.kw, o.eff, o.kwC);
     const bat = run('off'), win = run('winter'), ex = run('winter', 'summer'), all = run('all');
-    return { ...o, cfg: saving(sim(o.cap, gridMode, c.batExport, o.kw, o.eff)), base, bat: saving(bat), win: saving(win), ex: saving(ex), all: saving(all),
+    // energy leaving the battery a year (to the house plus anything sold), for the warranty throughput check
+    const thruOf = r => (sum1(r.bg) + sum1(r.self) - sum1(r.direct) + sum1(r.bx)) * annualise;
+    const cr = sim(o.cap, gridMode, c.batExport, o.kw, o.eff, o.kwC), nr = sim(o.cap, gridMode, 'off', o.kw, o.eff, o.kwC);
+    // peak-rate electricity still bought: with your settings, and if the battery is simply filled to 100% every night
+    const peakOf = r => { let v = 0; for (let i = 0; i < n; i++) if (!off[i]) v += r.imp[i]; return v * annualise; };
+    const fr = sim(o.cap, 'full', 'off', o.kw, o.eff, o.kwC);
+    return { ...o, cfg: saving(cr), thru: thruOf(cr), thruNoSell: thruOf(nr), peakCfg: peakOf(cr), peakFull: peakOf(fr), base, bat: saving(bat), win: saving(win), ex: saving(ex), all: saving(all),
       winKwh: sum1(win.bg) * annualise, exKwh: sum1(ex.bx) * annualise };
   });
   // How many panels? Generation scales with panel count, so rerun the same model on a scaled profile.
@@ -295,7 +305,7 @@ function compute() {
     const n1 = Math.min(np, cap1), n2 = np - n1;
     const same = n1 === c.roofs[0].panels && n2 === c.roofs[1].panels;
     const gs = same ? g : g.map((_, i) => n1 * gPer[0][i] + n2 * gPer[1][i]), mdl = same ? sim : makeModel(gs);
-    const solarOnly = saving(mdl(0, 'off')), run = c.battery > 0 ? mdl(c.battery, gridMode, c.batExport, c.batKw, c.batEff) : mdl(0, 'off');
+    const solarOnly = saving(mdl(0, 'off')), run = c.battery > 0 ? mdl(c.battery, gridMode, c.batExport, c.batKw, c.batEff, c.batKwCharge) : mdl(0, 'off');
     const full = c.battery > 0 ? saving(run) : solarOnly;
     let used = 0, made = 0; for (let i = 0; i < n; i++) { used += run.self[i]; made += gs[i]; }
     return { np, n1, n2, kwp: np * c.panelW / 1000, gen: n1 * y1 + n2 * y2, solarOnly, full, selfPct: made ? used / made : 0 };
@@ -313,8 +323,8 @@ function compute() {
     const mdl = k === 0 ? sim : makeModel(g.map(v => v * kp));
     const pk = peakNow * Math.pow(1 + gU, k), of = offNow * Math.pow(1 + gU, k), ex = c.exportRate * Math.pow(1 + gE, k);
     const val = r => { let v = 0; for (let i = 0; i < n; i++) v += (load[i] - r.imp[i]) * (off[i] ? of : pk) / 100 + r.exp[i] * ex / 100; return v * annualise; };
-    yearsCfg.push(val(mdl(c.battery * kb, gridMode, c.batExport, c.batKw, c.batEff)));
-    finOpts.forEach(o => yearsBy[o.name].push(val(mdl(o.cap * kb, gridMode, c.batExport, o.kw, o.eff))));
+    yearsCfg.push(val(mdl(c.battery * kb, gridMode, c.batExport, c.batKw, c.batEff, c.batKwCharge)));
+    finOpts.forEach(o => yearsBy[o.name].push(val(mdl(o.cap * kb, gridMode, c.batExport, o.kw, o.eff, o.kwC))));
   }
   // 5. per-day aggregates
   const standing = R.standing; let si = 0;
@@ -458,7 +468,7 @@ function buildLayout() {
     <label>Panel size (W)<input id="aW" type="number" min="100" step="5"></label>
     <label>Estimated generation (kWh/yr)<input id="aGen" type="text" disabled></label>
     <label>Export rate (p/kWh)<input id="aExp" type="number" min="0" step="0.5"></label>
-    <label>Battery<select id="aModel"><option value="evo10">Fox EVO 10 (9.7 kWh, 5 kW inverter)</option><option value="evo5">Fox EVO 5 (4.9 kWh, 3.68 kW inverter)</option><option value="custom">Custom</option></select></label>
+    <label>Battery<select id="aModel"><option value="evo10">Fox EVO 10 (9.7 kWh, 5 kW inverter)</option><option value="evo5">Fox EVO 5 (4.9 kWh, 3.68 kW inverter)</option><option value="pw3">Tesla Powerwall 3 (13.5 kWh, 11.04 kW inverter)</option><option value="custom">Custom</option></select></label>
     <label>Battery usable size (kWh, 0 = none)<input id="aBat" type="number" min="0" step="0.5"></label>
     <label>System cost (£)<input id="aCost" type="number" min="0" step="100" placeholder="for payback"></label>
     <label>Finance term (years, 0 = cash)<input id="aTerm" type="number" min="0" max="25" step="1"></label>
@@ -476,7 +486,8 @@ function buildLayout() {
     <label>Fallback off-peak rate (p/kWh)<input id="aOff" type="number" step="0.1"></label>
     <label>Fallback standing charge (p/day)<input id="aStand" type="number" step="0.1"></label>
     <label>Cost per panel added or removed (£)<input id="aPP" type="number" step="10" min="0"></label>
-    <label>Battery power (kW)<input id="aKw" type="number" step="0.1" min="0.5"></label>
+    <label>Battery discharge power (kW)<input id="aKw" type="number" step="0.1" min="0.5"></label>
+    <label>Battery charge power (kW)<input id="aKwC" type="number" step="0.1" min="0.5"></label>
     <label>Panel degradation (% a year)<input id="aDeg" type="number" step="0.1" min="0"></label>
     <label>Custom price change (% a year)<input id="aEsc" type="number" step="0.5"></label>
     <label>Export rate change (% a year)<input id="aXe" type="number" step="0.5"></label>
@@ -502,20 +513,20 @@ function buildLayout() {
       };
     }
   });
-  const bind = { aW: 'panelW', aPP: 'panelPrice', aExp: 'exportRate', aBat: 'battery', aCost: 'cost', aLat: 'lat', aLon: 'lon', aEv: 'evThr', aGrid: 'gridCharge', aBx: 'batExport', aKw: 'batKw', aDeg: 'deg', aEsc: 'escal', aXe: 'exportEscal', aBd: 'batDeg', aTrend: 'trend', aEff: 'batEff', aModel: 'batModel', aTerm: 'term', aApr: 'apr',
+  const bind = { aW: 'panelW', aPP: 'panelPrice', aExp: 'exportRate', aBat: 'battery', aCost: 'cost', aLat: 'lat', aLon: 'lon', aEv: 'evThr', aGrid: 'gridCharge', aBx: 'batExport', aKw: 'batKw', aKwC: 'batKwCharge', aDeg: 'deg', aEsc: 'escal', aXe: 'exportEscal', aBd: 'batDeg', aTrend: 'trend', aEff: 'batEff', aModel: 'batModel', aTerm: 'term', aApr: 'apr',
     aPeak: 'peak', aOff: 'offpeak', aStand: 'standing' };
   let timer;
   for (const [id, key] of Object.entries(bind)) {
     const inp = $('#' + id); inp.value = S.cfg[key];
     inp.oninput = () => {
-      if (['battery', 'batKw', 'batEff'].includes(key)) { S.cfg.batModel = 'custom'; $('#aModel').value = 'custom'; }
+      if (['battery', 'batKw', 'batKwCharge', 'batEff'].includes(key)) { S.cfg.batModel = 'custom'; $('#aModel').value = 'custom'; }
       const v = inp.tagName === 'SELECT' ? inp.value : inp.value === '' ? (key === 'cost' ? '' : DEF[key]) : +inp.value;
       S.cfg[key] = v;
       if (key === 'panelPrice' || key === 'panelW') { syncCfg(); if (key === 'panelPrice') syncCost(); }
       if (key === 'batModel' && PRODUCTS[v]) {
-        Object.assign(S.cfg, { battery: PRODUCTS[v].battery, batKw: PRODUCTS[v].batKw, batEff: PRODUCTS[v].batEff });
+        Object.assign(S.cfg, { battery: PRODUCTS[v].battery, batKw: PRODUCTS[v].batKw, batKwCharge: PRODUCTS[v].batKwCharge || PRODUCTS[v].batKw, batEff: PRODUCTS[v].batEff });
         S.cfg.cost = PRODUCTS[v].cost + (S.cfg.panels - QUOTE_PANELS) * S.cfg.panelPrice; $('#aCost').value = Math.round(S.cfg.cost);
-        $('#aBat').value = S.cfg.battery; $('#aKw').value = S.cfg.batKw; $('#aEff').value = S.cfg.batEff;
+        $('#aBat').value = S.cfg.battery; $('#aKw').value = S.cfg.batKw; $('#aKwC').value = S.cfg.batKwCharge; $('#aEff').value = S.cfg.batEff;
       }
       saveCfg();
       clearTimeout(timer); timer = setTimeout(() => { compute(); render(); }, 200);
@@ -749,6 +760,12 @@ function renderSolar(vd, T, nd, groups, labels, tipTitles, per, P, hours) {
       trow('Payback if bought in cash', x => yrLabel(x.f.cash)) +
       trow('Break-even on the finance deal', x => yrLabel(x.f.be)) +
       trow('Net position after 25 years', x => gbp(x.f.net)) +
+      trow('Peak-rate electricity still bought a year (your settings)', x => `${nf(x.peakCfg, 0)} kWh · ${gbp(x.peakCfg * D.peakAvg / 100)}`) +
+      trow('Peak-rate electricity still bought, battery filled to 100% every night', x => `${nf(x.peakFull, 0)} kWh · ${gbp(x.peakFull * D.peakAvg / 100)}`) +
+      trow('Warranty: battery energy out a year (your settings)', x => `${nf(x.thru, 0)} kWh`) +
+      trow('Warranty: throughput vs the datasheet limit over the warranty', x => x.warrMWh ? `${nf(x.thru * 12 / 1000, 1)} of ${x.warrMWh} MWh (${pct(x.thru * 12 / 1000 / x.warrMWh)})` : '—') +
+      trow('Warranty: same, if you never sell to the grid', x => x.warrMWh ? `${nf(x.thruNoSell * 12 / 1000, 1)} of ${x.warrMWh} MWh (${pct(x.thruNoSell * 12 / 1000 / x.warrMWh)})` : '—') +
+      trow('Warranty: capacity at year 12 vs 70% guarantee', x => `${pct(Math.max(0, 1 - c.batDeg / 100 * 12))} (assumed ${c.batDeg}% a year loss)`) +
       '</tbody></table></div>';
     chart('fin', `Cumulative £ after repayments: below zero you are still paying the system off · ${c.term ? c.term + '-year finance at ' + c.apr + '% APR' : 'bought in cash'} · panels −${c.deg}% a year, battery capacity −${c.batDeg}% a year, unit rates ${D.trendInfo.gU ? (D.trendInfo.gU > 0 ? '+' : '') + nf(D.trendInfo.gU * 100, 1) + '% a year' : 'held flat'}${D.trendInfo.gE ? ', export ' + (D.trendInfo.gE > 0 ? '+' : '') + nf(D.trendInfo.gE * 100, 1) + '% a year' : ''}`,
       { title: 'Cumulative position', labels: yrs.map(y => 'Yr ' + y), tipTitles: yrs.map(y => 'End of year ' + y), unit: '£', yFmt: v => nf(v, 0), valFmt: gbp,
@@ -1018,6 +1035,7 @@ if (new URLSearchParams(location.search).get('sel')) { const [a, b] = new URLSea
 if (new URLSearchParams(location.search).get('unit')) S.genUnit = new URLSearchParams(location.search).get('unit');
 if (new URLSearchParams(location.search).get('bill')) S.billSel = new URLSearchParams(location.search).get('bill');
 if (new URLSearchParams(location.search).get('trend')) S.cfg.trend = new URLSearchParams(location.search).get('trend');
+if (new URLSearchParams(location.search).get('bx')) S.cfg.batExport = new URLSearchParams(location.search).get('bx');
 if (new URLSearchParams(location.search).get('range')) S.range = new URLSearchParams(location.search).get('range');
 if (new URLSearchParams(location.search).get('bat')) S.cfg.battery = +new URLSearchParams(location.search).get('bat');
 if (['home', 'ev', 'both'].includes(new URLSearchParams(location.search).get('scope'))) S.scope = new URLSearchParams(location.search).get('scope');
