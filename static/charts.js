@@ -9,13 +9,18 @@ const Charts = (() => {
     tip.innerHTML = html;
     tip.classList.add('on');
     const r = tip.getBoundingClientRect();
-    let x = ev.clientX + 14, y = ev.clientY + 14;
-    if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
-    if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+    const touch = ev.pointerType === 'touch'; // keep the tooltip clear of the finger
+    let x = ev.clientX + 14, y = touch ? ev.clientY - r.height - 28 : ev.clientY + 14;
+    if (touch) x = ev.clientX - r.width / 2;
+    if (x + r.width > innerWidth - 8) x = touch ? innerWidth - r.width - 8 : ev.clientX - r.width - 14;
+    if (!touch && y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
     tip.style.left = Math.max(8, x) + 'px';
     tip.style.top = Math.max(8, y) + 'px';
   }
   const hideTip = () => tip.classList.remove('on');
+  // On touch screens there is no hover: show on tap/drag, hide when you tap elsewhere or scroll.
+  document.addEventListener('pointerdown', e => { if (!e.target.closest('.plot, .cal-grid')) hideTip(); });
+  addEventListener('scroll', hideTip, { passive: true });
 
   function niceTicks(max, n = 4) {
     if (!(max > 0)) return { step: 1, ticks: [0, 1] };
@@ -129,7 +134,7 @@ const Charts = (() => {
       }
     }
 
-    g += `<g id="hv"></g><rect id="hit" x="${m.l}" y="${m.t}" width="${pw}" height="${ph}" fill="transparent"/>`;
+    g += `<g id="hv"></g><rect id="hit" x="${m.l}" y="${m.t}" width="${pw}" height="${ph}" fill="transparent" style="touch-action:pan-y"/>`;
     el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(spec.title || '')}">${g}</svg>`;
 
     const hv = el.querySelector('#hv'), hit = el.querySelector('#hit');
@@ -147,7 +152,8 @@ const Charts = (() => {
       showTip(`<div class="th">${esc(spec.tipTitles ? spec.tipTitles[i] : spec.labels[i])}</div>${rows}${total}`, ev);
     };
     hit.addEventListener('pointermove', move);
-    hit.addEventListener('pointerleave', () => { hv.innerHTML = ''; hideTip(); });
+    hit.addEventListener('pointerdown', move);
+    hit.addEventListener('pointerleave', ev => { if (ev.pointerType === 'touch') return; hv.innerHTML = ''; hideTip(); });
   }
 
   const RAMP_LIGHT = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b'];
@@ -188,11 +194,13 @@ const Charts = (() => {
     });
     el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img">${g}</svg>`;
     el.querySelectorAll('rect').forEach(rc => {
-      rc.addEventListener('pointermove', ev => {
+      const show = ev => {
         const r = +rc.dataset.r, c = +rc.dataset.c;
         showTip(`<div class="th">${esc(spec.rows[r])} ${esc(spec.colTitle(c))}</div><div class="tr"><span>${esc(spec.label)}</span><b>${esc(spec.fmt(spec.values[r][c]))}</b></div>`, ev);
-      });
-      rc.addEventListener('pointerleave', hideTip);
+      };
+      rc.addEventListener('pointermove', show);
+      rc.addEventListener('pointerdown', show);
+      rc.addEventListener('pointerleave', ev => { if (ev.pointerType !== 'touch') hideTip(); });
     });
     if (legendEl) {
       const stops = [0, 0.25, 0.5, 0.75, 1].map(t => ramp(t)).join(',');

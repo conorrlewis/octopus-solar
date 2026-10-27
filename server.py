@@ -6,14 +6,17 @@ machine (it is stored in config.json and never sent to the browser).
 
     python3 server.py            # http://127.0.0.1:8765
     python3 server.py 9000       # custom port
+    python3 server.py --lan      # also reachable from other devices on your home network
 """
 import base64
+import ipaddress
 import json
 import math
 import mimetypes
 import os
 import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -38,6 +41,37 @@ CONFIG_FILE = ROOT / "config.json"
 CACHE_FILE = ROOT / "cache.json"
 CACHE_TTL = 30 * 60  # seconds
 LOCK = threading.Lock()
+LAN = False  # set by --lan: listen on the local network instead of only this computer
+
+
+def _ip(addr):
+    try:
+        ip = ipaddress.ip_address(addr.split("%")[0])
+        return ip.ipv4_mapped or ip if ip.version == 6 else ip
+    except ValueError:
+        return None
+
+
+def is_loopback(addr):
+    ip = _ip(addr)
+    return bool(ip and ip.is_loopback)
+
+
+def is_private(addr):
+    ip = _ip(addr)
+    return bool(ip and (ip.is_private or ip.is_loopback))
+
+
+def lan_addresses():
+    ips = set()
+    try:  # no packet is sent; this just asks the OS which address it would use
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    return sorted(ips)
 
 
 class ApiError(Exception):
@@ -331,8 +365,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _local_only(self):
-        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
-        if host not in ("127.0.0.1", "localhost", "[::1]"):
+        """Only talk to this computer, or (with --lan) to devices on the home network. The Host check also
+        blocks DNS-rebinding attacks from web pages."""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        ok = host in ("127.0.0.1", "localhost", "::1")
+        if LAN and not ok:
+            ok = is_private(host) or host.endswith(".local")
+        if ok and LAN and not is_private(self.client_address[0]):
+            ok = False
+        if not ok:
             self._send(403, {"error": "forbidden"})
             return False
         return True
@@ -344,8 +385,9 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/status":
             cfg = load_config()
             ok = bool(cfg.get("apiKey") and cfg.get("account"))
+            here = is_loopback(self.client_address[0])
             return self._send(200, {"configured": ok, "account": cfg.get("account") if ok else None,
-                                    "keyHint": cfg["apiKey"][-4:] if ok else None})
+                                    "keyHint": cfg["apiKey"][-4:] if ok and here else None})
         if url.path == "/api/data":
             q = parse_qs(url.query)
             try:
@@ -366,6 +408,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._local_only():
             return
         path = urlparse(self.path).path
+        if not is_loopback(self.client_address[0]):  # the key and account can only be changed from this computer
+            return self._send(403, {"error": "Change the connection from the computer running the dashboard."})
         length = int(self.headers.get("Content-Length") or 0)
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -403,10 +447,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    global LAN
+    args = sys.argv[1:]
+    LAN = "--lan" in args or os.environ.get("LAN") == "1"
+    port = next((int(a) for a in args if a.isdigit()), 8765)
+    httpd = ThreadingHTTPServer(("0.0.0.0" if LAN else "127.0.0.1", port), Handler)
     url = "http://127.0.0.1:%d" % port
     print("Octopus dashboard running at %s  (Ctrl+C to stop)" % url)
+    if LAN:
+        for ip in lan_addresses():
+            print("On your network:  http://%s:%d   (viewing only; connect or disconnect from this computer)" % (ip, port))
     if os.environ.get("NO_BROWSER") != "1":
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:

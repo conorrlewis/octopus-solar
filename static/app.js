@@ -187,7 +187,7 @@ function compute() {
   for (let i = 0; i < n;) {
     if (S.kwh[i] < thr) { i++; continue; }
     let j = i; while (j < n && S.kwh[j] >= thr) j++;
-    if (j - i >= 2) {
+    if (j - i >= 2 || S.kwh[i] >= 2.5) { // a lone slot above ~2.5 kWh can only be the charger (smart-charge slots are often single)
       for (let k = i; k < j; k++) isEv[k] = 1;
       if (i > 0 && S.kwh[i - 1] >= 0.6 * thr) isEv[i - 1] = 1;
       if (j < n && S.kwh[j] >= 0.6 * thr) isEv[j] = 1;
@@ -462,6 +462,7 @@ function buildLayout() {
   mkCard(U, 'typical', 'A typical day');
   mkCard(U, 'heat', 'When the house is busy');
   mkCard(U, 'top', 'Biggest days', { cls: 'wide', noTable: true });
+  cards.top.plot.style.overflowX = 'auto';
 
   const a = mkCard(V, 'assump', 'Your solar assumptions', { cls: 'wide', noTable: true });
   a.plot.innerHTML = `<div class="assump">
@@ -494,13 +495,18 @@ function buildLayout() {
     <label>Battery capacity loss (% a year)<input id="aBd" type="number" step="0.1" min="0"></label>
     <label>Battery round-trip efficiency (%)<input id="aEff" type="number" step="1" min="50" max="100"></label></div>
     <p class="hint">Fallback rates are only used when Octopus tariff rates can't be fetched. The battery discharges only when power is at the peak rate. With grid charging on, it charges overnight at the off-peak rate only as far as tomorrow's shortfall after solar needs (it is assumed to forecast your usage well). Battery presets follow the Fox ESS datasheets: EVO 10 = 10.24 kWh × 95% depth of discharge = 9.73 kWh usable, 5 kW inverter, ~94% round trip; EVO 5 = 5.12 kWh = 4.86 kWh usable, 3.68 kW inverter, ~90% round trip. Panels follow the JA Solar 455 W datasheet (0.4% a year degradation); the quote is 11 panels for 4,359 kWh a year, and other panel counts scale that linearly. The £400 per panel added or removed is a placeholder, so replace it with your installer's figure. Battery capacity fades 2% a year by default (the datasheet's 6,000-cycle life is about 16 years of daily cycling; that is my estimate, not a datasheet figure). Selling to the grid fills the battery off-peak, covers your home use first, and exports the rest at the export rate; check your export tariff allows battery export.</p></details>`;
-  const roofHtml = ['Roof 1', 'Roof 2'].map((nm, k) => `<div class="rn" id="r${k + 1}n">${nm}</div>
-    <input id="r${k + 1}p" type="number" min="0" max="60" step="1"><input id="r${k + 1}max" type="number" min="0" max="60" step="1"><input id="r${k + 1}az" type="number" min="0" max="180" step="5">
-    <select id="r${k + 1}side"><option value="E">East</option><option value="W">West</option></select>
-    <input id="r${k + 1}tilt" type="number" min="0" max="90" step="1"><input id="r${k + 1}shade" type="number" min="0.1" max="1" step="0.01">
-    <input id="r${k + 1}kk" type="number" min="100" max="1200" step="1"><input id="r${k + 1}gen" type="text" disabled>`).join('');
-  $('#roofs').innerHTML = `<div class="rh"></div><div class="rh">Panels</div><div class="rh">Space (max panels)</div><div class="rh">Orientation (° from south)</div><div class="rh">Faces</div><div class="rh">Roof pitch (°)</div><div class="rh">Shade factor</div><div class="rh">Irradiance Kk (kWh/kWp)</div><div class="rh">Generation (kWh/yr)</div>${roofHtml}
-    <p class="hint" style="grid-column:1/-1;margin:2px 0 0">0° = due south, 90° = east or west, 180° = north. Kk is the installer's irradiance figure; changing orientation or pitch re-estimates it, and you can overwrite it with the figure from your quote. Generation = panels × panel size × Kk × shade factor. Roof 1 matches the Octopus quote (11 panels, 4,359 kWh). The panel comparison fills roof 1 first, then roof 2; roof 2 is off at 0 panels.</p>`;
+  const f = (id, label, inner) => `<label>${label}${inner}</label>`;
+  const num = (id, min, max, step) => `<input id="${id}" type="number" inputmode="decimal" min="${min}" max="${max}" step="${step}">`;
+  $('#roofs').innerHTML = ['Roof 1', 'Roof 2'].map((nm, k) => {
+    const r = `r${k + 1}`;
+    return `<div class="roof"><div class="rn" id="${r}n">${nm}</div><div class="rg">` +
+      f(r + 'p', 'Panels', num(r + 'p', 0, 60, 1)) + f(r + 'max', 'Space (max panels)', num(r + 'max', 0, 60, 1)) +
+      f(r + 'az', 'Orientation (° from south)', num(r + 'az', 0, 180, 5)) +
+      f(r + 'side', 'Faces', `<select id="${r}side"><option value="E">East</option><option value="W">West</option></select>`) +
+      f(r + 'tilt', 'Roof pitch (°)', num(r + 'tilt', 0, 90, 1)) + f(r + 'shade', 'Shade factor', num(r + 'shade', 0.1, 1, 0.01)) +
+      f(r + 'kk', 'Irradiance Kk (kWh/kWp)', num(r + 'kk', 100, 1200, 1)) +
+      f(r + 'gen', 'Generation (kWh/yr)', `<input id="${r}gen" type="text" disabled>`) + '</div></div>';
+  }).join('') + `<p class="hint" style="margin:2px 0 0">0° = due south, 90° = east or west, 180° = north. Kk is the installer's irradiance figure; changing orientation or pitch re-estimates it, and you can overwrite it with the figure from your quote. Generation = panels × panel size × Kk × shade factor. Roof 1 matches the Octopus quote (11 panels, 4,359 kWh). The panel comparison fills roof 1 first, then roof 2; roof 2 is off at 0 panels.</p>`;
   let rtimer;
   S.cfg.roofs.forEach((r, k) => {
     for (const [suf, key] of Object.entries({ p: 'panels', max: 'max', az: 'az', side: 'side', tilt: 'tilt', shade: 'shade', kk: 'kk' })) {
@@ -1036,6 +1042,8 @@ if (new URLSearchParams(location.search).get('unit')) S.genUnit = new URLSearchP
 if (new URLSearchParams(location.search).get('bill')) S.billSel = new URLSearchParams(location.search).get('bill');
 if (new URLSearchParams(location.search).get('trend')) S.cfg.trend = new URLSearchParams(location.search).get('trend');
 if (new URLSearchParams(location.search).get('bx')) S.cfg.batExport = new URLSearchParams(location.search).get('bx');
+for (const k of ['term', 'apr']) if (new URLSearchParams(location.search).get(k)) S.cfg[k] = +new URLSearchParams(location.search).get(k);
+if (new URLSearchParams(location.search).get('roof2')) S.cfg.roofs[1].panels = +new URLSearchParams(location.search).get('roof2');
 if (new URLSearchParams(location.search).get('range')) S.range = new URLSearchParams(location.search).get('range');
 if (new URLSearchParams(location.search).get('bat')) S.cfg.battery = +new URLSearchParams(location.search).get('bat');
 if (['home', 'ev', 'both'].includes(new URLSearchParams(location.search).get('scope'))) S.scope = new URLSearchParams(location.search).get('scope');

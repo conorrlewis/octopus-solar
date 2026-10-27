@@ -4,6 +4,8 @@ A local dashboard for your Octopus Energy half-hourly usage, plus a solar + batt
 
     python3 server.py          # opens http://127.0.0.1:8765
 
+To open it from a phone or another computer on your home network, start it with `python3 server.py --lan` and use the `192.168.x.x` address it prints. Other devices can view the dashboard but cannot change the Octopus connection, which can only be changed from the computer running the server. Only devices on private network addresses are accepted. The first time, macOS asks whether Python may accept incoming connections: allow it.
+
 Click **Connection** and enter your API key (`sk_live_…`) and account number (`A-XXXXXXXX`) from octopus.energy → Account → Personal details → API access. They are saved to `config.json` (owner-only permissions, git-ignored) and used only for calls to api.octopus.energy. `http://127.0.0.1:8765/?demo=1` shows synthetic data. Fetched data is cached in `cache.json` (also git-ignored).
 
 ## What it shows
