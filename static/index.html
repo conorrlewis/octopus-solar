@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Octopus energy &amp; solar dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="top-in">
+    <div class="brand">
+      <h1>Energy &amp; solar</h1>
+      <span id="source" class="chip">Loading…</span>
+    </div>
+    <div class="controls">
+      <button class="chip" id="selChip" hidden title="Clear the calendar filter"></button>
+      <div class="seg" id="scope" role="group" aria-label="Show home, EV or both">
+        <button data-v="home">Home</button>
+        <button data-v="ev">EV</button>
+        <button data-v="both">Both</button>
+      </div>
+      <div class="seg" id="range" role="group" aria-label="Date range">
+        <button data-v="7">7 days</button>
+        <button data-v="30">30 days</button>
+        <button data-v="90">90 days</button>
+        <button data-v="180">6 months</button>
+        <button data-v="365">12 months</button>
+        <button data-v="all">All</button>
+      </div>
+      <div class="seg" id="group" role="group" aria-label="Group bars by">
+        <button data-v="auto">Auto</button>
+        <button data-v="day">Day</button>
+        <button data-v="week">Week</button>
+        <button data-v="month">Month</button>
+      </div>
+      <button class="btn" id="refresh" title="Re-fetch from Octopus">Refresh</button>
+      <button class="btn" id="theme" title="Toggle light / dark">Theme</button>
+      <button class="btn" id="conn">Connection</button>
+    </div>
+  </div>
+</header>
+
+<main id="app">
+  <div id="msg" class="notice" hidden></div>
+  <section id="kpis" class="tiles"></section>
+
+  <h2>How you use energy</h2>
+  <div class="grid" id="usage"></div>
+
+  <h2>What solar could do for you</h2>
+  <div class="grid" id="solar"></div>
+
+  <p class="foot">Solar output is a <strong>model</strong>: your annual estimate is spread over the year using a typical UK seasonal curve and sun position — real days vary with cloud. EV charging is detected from sustained high half-hourly draw; the <strong>Home / EV / Both</strong> filter chooses which of it the charts and the solar model cover (solar only offsets what is selected — Home by default, since the EV keeps charging off-peak). Costs use Octopus unit rates and standing charges when available.</p>
+</main>
+
+<dialog id="setup">
+  <form method="dialog" id="setupForm">
+    <h3>Connect to Octopus Energy</h3>
+    <p class="hint">Find your API key and account number at <strong>octopus.energy → Account → Personal details → API access</strong>. They are stored only in <code>config.json</code> on this computer and sent only to Octopus.</p>
+    <label>API key<input id="apiKey" type="password" placeholder="sk_live_…" autocomplete="off"></label>
+    <label>Account number<input id="account" placeholder="A-1234ABCD" autocomplete="off"></label>
+    <label>History to load
+      <select id="days"><option value="365">12 months</option><option value="730">24 months</option></select>
+    </label>
+    <div id="setupErr" class="err" hidden></div>
+    <div class="row">
+      <button class="btn primary" id="saveConn" type="button">Connect</button>
+      <button class="btn" id="useDemo" type="button">Explore with demo data</button>
+      <button class="btn" id="disconnect" type="button" hidden>Disconnect</button>
+      <button class="btn ghost" id="closeSetup" type="button">Close</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="tip" class="tip" role="tooltip"></div>
+<script src="charts.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
