@@ -3,21 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0b10" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f3f4f8" media="(prefers-color-scheme: light)">
 <title>Octopus energy &amp; solar dashboard</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="top">
   <div class="top-in">
-    <div class="brand">
-      <h1>Energy &amp; solar</h1>
-      <span id="source" class="chip">Loading…</span>
+    <div class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none"/><path d="M12 2.5v2.6M12 18.9v2.6M2.5 12h2.6M18.9 12h2.6M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M18.7 5.3l-1.8 1.8M7.1 16.9l-1.8 1.8"/></svg></span>
+        <div><h1>Energy &amp; solar</h1><span id="source" class="chip">Loading…</span></div>
+      </div>
+      <nav class="jump" aria-label="Sections"><a href="#sec-usage">Usage</a><a href="#sec-design">Design</a><a href="#sec-savings">Savings</a></nav>
+      <div class="actions">
+        <button class="btn" id="refresh" title="Re-fetch from Octopus">Refresh</button>
+        <button class="btn" id="theme" title="Toggle light / dark">Theme</button>
+        <button class="btn primary" id="conn">Connection</button>
+      </div>
     </div>
-    <div class="controls">
+    <div class="filters">
       <button class="chip" id="selChip" hidden title="Clear the calendar filter"></button>
-      <div class="seg" id="scope" role="group" aria-label="Show home, EV or both">
+      <div class="seg" id="scope" hidden role="group" aria-label="Show home, EV or both">
         <button data-v="home">Home</button>
         <button data-v="ev">EV</button>
         <button data-v="both">Both</button>
@@ -36,24 +44,29 @@
         <button data-v="week">Week</button>
         <button data-v="month">Month</button>
       </div>
-      <button class="btn" id="refresh" title="Re-fetch from Octopus">Refresh</button>
-      <button class="btn" id="theme" title="Toggle light / dark">Theme</button>
-      <button class="btn" id="conn">Connection</button>
     </div>
   </div>
 </header>
 
 <main id="app">
+  <section class="hero">
+    <p class="eyebrow">Your Octopus data</p>
+    <h2 class="hero-h">What you use, what you pay, and what solar could save you</h2>
+    <p class="lede">Built from your own half-hourly smart-meter readings and your actual tariff. Design a system for your roof below and watch the savings update as you go.</p>
+  </section>
   <div id="msg" class="notice" hidden></div>
   <section id="kpis" class="tiles"></section>
 
-  <h2>How you use energy</h2>
+  <div class="sec" id="sec-usage"><span class="num">1</span><div><h2>How you use energy</h2><p class="lede">When you use power, what it costs, and how it splits across rates. Click a day in the calendar to focus every chart.</p></div></div>
   <div class="grid" id="usage"></div>
 
-  <h2>What solar could do for you</h2>
+  <div class="sec" id="sec-design"><span class="num">2</span><div><h2>Design your solar system</h2><p class="lede">Find your roof, lay out panels, then slide panels, battery and inverter to see the bill saving. Add your installer's price to see payback.</p></div></div>
+  <div class="grid" id="planner"></div>
+
+  <div class="sec" id="sec-savings"><span class="num">3</span><div><h2>What solar could do for you</h2><p class="lede">The detail behind the saving: bills before and after, battery value, panel count, finance and the 25-year outlook.</p></div></div>
   <div class="grid" id="solar"></div>
 
-  <p class="foot">Solar output is a <strong>model</strong>: your annual estimate is spread over the year using a typical UK seasonal curve and sun position — real days vary with cloud. EV charging is detected from sustained high half-hourly draw; the <strong>Home / EV / Both</strong> filter chooses which of it the charts and the solar model cover (solar only offsets what is selected — Home by default, since the EV keeps charging off-peak). Costs use Octopus unit rates and standing charges when available.</p>
+  <p class="foot">Your roof, its shading and the panel layout are <strong>estimates</strong> from public map data and the options you choose. Solar output is a <strong>model</strong>: your annual estimate is spread over the year using a typical UK seasonal curve and sun position — real days vary with cloud. <span id="evFoot">EV charging is detected from sustained high half-hourly draw; the <strong>Home / EV / Both</strong> filter chooses which of it the charts and the solar model cover (solar only offsets what is selected — Home by default, since the EV keeps charging off-peak).</span> Costs use Octopus unit rates and standing charges when available.</p>
 </main>
 
 <dialog id="setup">
@@ -77,6 +90,8 @@
 
 <div id="tip" class="tip" role="tooltip"></div>
 <script src="charts.js"></script>
+<script src="map.js"></script>
+<script src="planner.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -3,32 +3,19 @@ const $ = (s, el = document) => el.querySelector(s);
 const esc = Charts.esc;
 
 /* ------------------------------------------------------------ settings ---- */
-// Defaults from the datasheets: Fox ESS EVO 10 (10.24 kWh, 95% DoD = 9.73 kWh usable; 97.3% PV->battery and
-// 96.4% battery->AC efficiency, ~93% round trip; AC power depends on the inverter variant, 3.7-10 kW)
-// and JA Solar JAM54D41 455 W panels (1% first-year then 0.4%/yr degradation).
-const QUOTE_PANELS = 11; // the Octopus quote: 11 x JA Solar 455 W panels, estimated at 4,359 kWh a year
-// Roofs (arrays). Roof 1 reproduces the Octopus quote (11 panels, Kk 871 -> 4,359 kWh); roof 2 is off until it has panels.
-// Orientation is degrees from due south (side says east or west); Kk is the MCS irradiance figure in kWh per kWp a year.
-// 11 panels fit on the SW roof; any more go on the shadier opposite (NE) roof. Roof 2's shade factor of 0.85 is a placeholder.
-const DEF_ROOFS = [{ panels: QUOTE_PANELS, max: QUOTE_PANELS, az: 50, side: 'W', tilt: 37, shade: 1, kk: 871 },
-  { panels: 0, max: 20, az: 130, side: 'E', tilt: 37, shade: 0.85, kk: 600 }];
+// Prices and modelling inputs. The roof (faces, shading), panel count, battery and inverter are set by the planner (planner.js),
+// which writes them into S.cfg.roofs, S.cfg.battery and S.cfg.inverter; the model below reads them from there.
+// Orientation is degrees from due south (side says east or west); Kk is the MCS-style irradiance figure in kWh per kWp a year.
 const compass = (az, side) => ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round((((180 + (side === 'W' ? az : -az)) % 360) + 360) % 360 / 45) % 8];
-const DEF = { panelW: 455, panelPrice: 400, annual: 4359, panels: QUOTE_PANELS, exportRate: 12, battery: 9.73, cost: 11497, lat: 52, lon: -1.5,
-  evThr: 1.4, peak: 34.27, offpeak: 6.6, standing: 50.75, gridCharge: 'winter', batExport: 'summer', batKw: 5, batKwCharge: 5, batEff: 94, batModel: 'evo10', deg: 0.4, escal: 0, term: 10, apr: 4.9, batDeg: 2, trend: 'h2', exportEscal: 0 };
-// Fox ESS datasheets: usable = nominal kWh x 95% depth of discharge; round trip = PV->battery x battery->AC efficiency
-// (EVO 5: 95.4% x 94.5% = 90%; EVO 10: 97.3% x 96.4% = 94%). The EVO 5 ships with the 3.68 kW inverter, the EVO 10 with 5 kW.
-const PRODUCTS = {
-  // warrMWh: Fox ESS UK battery warranty v4.5 keeps >=70% of nominal capacity for 12 years or until this energy throughput.
-  evo5: { name: 'Fox EVO 5', battery: 4.86, batKw: 3.68, batEff: 90, cost: 10109, warrMWh: 23.99 }, // system prices quoted by the user
-  evo10: { name: 'Fox EVO 10', battery: 9.73, batKw: 5, batEff: 94, cost: 11497, warrMWh: 47.88 },
-  // Tesla Powerwall 3 (datasheet): 13.5 kWh, up to 11.04 kW AC output but charging is limited to 5 kW; 89% solar->battery->home
-  // efficiency; 10-year warranty (the datasheet gives no throughput limit). Price quoted by the user, incl. the 11.04 kW inverter.
-  pw3: { name: 'Tesla Powerwall 3', battery: 13.5, batKw: 11.04, batKwCharge: 5, batEff: 89, cost: 14160, warrMWh: null },
-};
+// The tool does not estimate what an installation costs: `cost` is the price you type in (0 = none), and costFor records which
+// system (panels, battery, inverter) that price was for.
+const DEF = { panelW: 455, exportRate: 12, battery: 5, inverter: 5, batKw: 2.5, batKwCharge: 2.5, batEff: 90, lat: 52, lon: -1.5,
+  sysLoss: 14, invLoss: 3, optLoss: 0, shadeLoss: 0, perfAdj: 0, evThr: 1.4, peak: 27.7, offpeak: 27.7, standing: 53, gridCharge: 'all', batExport: 'off', cost: 0, costFor: null,
+  deg: 0.4, escal: 0, term: 0, apr: 6.9, batDeg: 2, trend: 'h2', exportEscal: 0 };
 function loadCfg() {
-  const saved = JSON.parse(localStorage.getItem('octo.cfg') || '{}'), cfg = Object.assign({}, DEF, saved);
-  cfg.roofs = DEF_ROOFS.map((d, i) => Object.assign({}, d, (saved.roofs || [])[i] || {}));
-  return cfg;
+  const saved = JSON.parse(localStorage.getItem('octo.cfg2') || '{}');
+  if (saved.panelW === 450) delete saved.panelW; // the old default; the default is now 455 W
+  return Object.assign({}, DEF, saved, { roofs: [], panels: 0, annual: 0 }); // roofs are rebuilt by the planner
 }
 const S = {
   cfg: loadCfg(),
@@ -37,9 +24,14 @@ const S = {
   scope: localStorage.getItem('octo.scope') || 'home', // which load the charts and solar model cover: home | ev | both
   days: +(localStorage.getItem('octo.days') || 365),
   demo: localStorage.getItem('octo.demo') === '1',
-  selDay: null, raw: null, D: null, calMonth: null, billSel: 'avg', calMetric: 'load', genUnit: localStorage.getItem('octo.genUnit') || 'kwh', sel: null, anchor: null, // sel = {from, to} picked on the calendar; overrides the preset range
+  hasEv: false, selDay: null, raw: null, D: null, ctx: null, fs: {}, calMonth: null, billSel: 'avg', calMetric: 'load', genUnit: localStorage.getItem('octo.genUnit') || 'kwh', sel: null, anchor: null, // sel = {from, to} picked on the calendar; overrides the preset range
 };
-const saveCfg = () => localStorage.setItem('octo.cfg', JSON.stringify(S.cfg));
+const saveCfg = () => { const { roofs, ...rest } = S.cfg; localStorage.setItem('octo.cfg2', JSON.stringify(rest)); };
+const netCost = c => Math.max(0, +c.cost || 0);
+// Battery power follows the inverter, and about half a kW per kWh is what home batteries manage: 5 kWh -> 2.5 kW, 10 kWh -> 5 kW.
+const batPower = (cap, inv) => cap > 0 ? Math.min(inv, Math.max(2.5, cap * 0.5)) : 0;
+// Modelled output is a smooth average-weather day, whose peaks sit below a sunny day's, so the inverter's limit is applied at 70%.
+const clipLimit = kw => kw > 0 ? kw * 0.7 / 2 : Infinity; // kWh per half hour
 
 /* ------------------------------------------------------------- helpers ---- */
 const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -71,7 +63,7 @@ function ingest(raw) {
   S.raw = raw;
   const n = raw.consumption.length;
   S.t = new Float64Array(n); S.kwh = new Float64Array(n); S.hh = new Uint8Array(n); S.dow = new Uint8Array(n);
-  S.date = new Array(n);
+  S.date = new Array(n); S.fs = {};
   const fmt = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hourCycle: 'h23', year: 'numeric',
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', weekday: 'short' });
   const wd = { Mon: 0, Tue: 1, Wed: 2, Thu: 3, Fri: 4, Sat: 5, Sun: 6 };
@@ -135,24 +127,71 @@ function makeRoofNorm(lat, lon, az, side, tilt) {
     return E[doy] ? share[doy] * poaIrr(doy, d.getUTCHours() + d.getUTCMinutes() / 60, lat, lon, psi, beta) / E[doy] : 0;
   };
 }
-// Estimated Kk (kWh per kWp a year) from orientation and pitch; calibrated so 50° from south at 37° gives the quoted 870.
+// Gross yield (kWh per kWp a year, before any losses) from orientation and pitch: 1,130 for a south-facing 35° roof at 52°N, falling
+// about 2.5% for every degree further north, as UK solar irradiation does. The losses below are applied on top.
+const GROSS = 1130;
+// Combined performance factor from the loss assumptions: system, inverter, optimizer and extra shading losses, then any adjustment.
+const lossFactor = c => (1 - c.sysLoss / 100) * (1 - c.invLoss / 100) * (1 - c.optLoss / 100) * (1 - c.shadeLoss / 100) * (1 + c.perfAdj / 100);
 function kkEstimate(lat, lon, az, tilt) {
-  return Math.round(947 * yearSum(dayEnergies(lat, lon, az * RAD, tilt * RAD)) / yearSum(dayEnergies(lat, lon, 0, 35 * RAD)));
+  const lf = 1 - 0.025 * (lat - 52);
+  return Math.round(GROSS * lf * yearSum(dayEnergies(lat, lon, az * RAD, tilt * RAD)) / yearSum(dayEnergies(lat, lon, 0, 35 * RAD)));
 }
-const roofYield = r => S.cfg.panelW / 1000 * r.kk * r.shade; // kWh a year from one panel on this roof
+const roofYield = r => S.cfg.panelW / 1000 * r.kk * r.shade * lossFactor(S.cfg); // kWh a year from one panel on this roof, after losses
 function syncCfg() {
   const c = S.cfg;
   c.panels = c.roofs.reduce((a, r) => a + r.panels, 0);
   c.kwp = c.panels * c.panelW / 1000;
   c.annual = c.roofs.reduce((a, r) => a + r.panels * roofYield(r), 0);
-  if ($('#aGen')) $('#aGen').value = nf(c.annual, 0);
-  c.roofs.forEach((r, k) => {
-    const e = $(`#r${k + 1}gen`); if (e) e.value = nf(r.panels * roofYield(r), 0);
-    const nm = $(`#r${k + 1}n`); if (nm) nm.textContent = `Roof ${k + 1} · ${compass(r.az, r.side)}`;
-  });
 }
-function syncCost() {
-  if (PRODUCTS[S.cfg.batModel]) { S.cfg.cost = PRODUCTS[S.cfg.batModel].cost + (S.cfg.panels - QUOTE_PANELS) * S.cfg.panelPrice; $('#aCost').value = Math.round(S.cfg.cost); }
+// Share out `total` panels over the roof faces, best yield first, each up to its capacity (`max`).
+function allocPanels(roofs, total) {
+  const out = roofs.map(() => 0); let left = total;
+  roofs.map((r, k) => k).sort((a, b) => roofYield(roofs[b]) - roofYield(roofs[a])).forEach(k => { const m = Math.min(left, roofs[k].max); out[k] = m; left -= m; });
+  return out;
+}
+// One panel on a roof face: kWh in each half-hour slot of the loaded data (cached; faces rarely change).
+function faceSeries(r) {
+  const key = [S.t.length, S.t[0], S.cfg.lat, S.cfg.lon, S.cfg.panelW, lossFactor(S.cfg), r.az, r.side, r.tilt, r.kk, r.shade].join();
+  if (S.fs[key]) return S.fs[key];
+  if (Object.keys(S.fs).length > 40) S.fs = {};
+  const norm = makeRoofNorm(S.cfg.lat, S.cfg.lon, r.az, r.side, r.tilt), per = roofYield(r), out = new Float64Array(S.t.length);
+  for (let i = 0; i < out.length; i++) out[i] = norm(S.t[i]) * per;
+  return (S.fs[key] = out);
+}
+// Value of a design (panels per roof face, battery kWh, inverter kW) over the loaded usage: £ saved in each of the next 25 years.
+// Panel and battery fade and the price trend are applied; the model is run at a few sample years and interpolated between them.
+// `full` samples four years (for what is shown), `false` two, and 'y1' only the first year (cheap, for "what would one more panel add").
+function evalDesign(faces, counts, cap, invKw, full) {
+  const X = S.ctx, c = S.cfg, n = X.n, raw = new Float64Array(n);
+  let annual = 0, panels = 0;
+  faces.forEach((r, k) => {
+    const m = counts[k]; if (!m) return;
+    const s = faceSeries(r); for (let i = 0; i < n; i++) raw[i] += m * s[i];
+    annual += m * roofYield(r); panels += m;
+  });
+  let rawSum = 0; for (let i = 0; i < n; i++) rawSum += raw[i];
+  const ann = rawSum ? annual / rawSum : 365.25 / (n / 48), lim = clipLimit(invKw), kw = batPower(cap, invKw);
+  const ks = full === 'y1' ? [0] : full ? [0, 8, 16, 24] : [0, 24], gs = new Float64Array(n);
+  const pts = ks.map(k => {
+    const kp = Math.max(0, 1 - c.deg / 100 * k), kb = Math.max(0.3, 1 - c.batDeg / 100 * k);
+    let gen = 0; for (let i = 0; i < n; i++) { gs[i] = Math.min(raw[i] * kp, lim); gen += gs[i]; }
+    const r = X.makeModel(gs)(cap * kb, c.gridCharge, c.batExport, kw, c.batEff, kw);
+    let imp = 0, exp = 0, self = 0, cov = 0, bill = 0;
+    for (let i = 0; i < n; i++) { const d = X.load[i] - r.imp[i]; imp += d * X.prate[i]; cov += d; exp += r.exp[i]; self += r.self[i]; bill += X.load[i] * X.prate[i]; }
+    return { bill: bill / 100 * ann, imp: imp / 100 * ann, exp: exp * c.exportRate / 100 * ann, gen: gen * ann, self: self * ann, cov: cov * ann };
+  });
+  const lerp = (f, k) => { if (ks.length === 1) return f(pts[0]); let j = 0; while (j < ks.length - 2 && k > ks[j + 1]) j++; const t = (k - ks[j]) / (ks[j + 1] - ks[j]); return f(pts[j]) * (1 - t) + f(pts[j + 1]) * t; };
+  const years = Array.from({ length: 25 }, (_, k) => lerp(p => p.imp, k) * Math.pow(1 + X.gU, k) + lerp(p => p.exp, k) * Math.pow(1 + X.gE, k));
+  const p0 = pts[0], used = X.loadSum * ann;
+  return { years, y1: years[0], billBefore: p0.bill, total: years.reduce((a, v) => a + v, 0), gen: p0.gen, selfPct: p0.gen ? p0.self / p0.gen : 0, covered: used ? p0.cov / used : 0,
+    kwp: panels * c.panelW / 1000, panels, annual };
+}
+// Years until the savings add up to the cost (interpolated), or null if not within 25 years.
+function paybackYears(years, cost) {
+  if (cost <= 0) return 0;
+  let cum = 0;
+  for (let k = 0; k < years.length; k++) { if (cum + years[k] >= cost) return k + (cost - cum) / years[k]; cum += years[k]; }
+  return null;
 }
 
 /* ------------------------------------------------------------- compute ---- */
@@ -183,7 +222,7 @@ function compute() {
   for (let i = 0; i < n; i++) off[i] = tou && rate[i] <= min + 0.25 * (max - min) ? 1 : 0;
 
   // 2. EV detection: runs of >=2 slots over the threshold (+ ramp-up/down slots either side)
-  const thr = c.evThr;
+  const thr = S.hasEv ? c.evThr : Infinity; // no EV or charger on the account: nothing is split out as EV charging
   for (let i = 0; i < n;) {
     if (S.kwh[i] < thr) { i++; continue; }
     let j = i; while (j < n && S.kwh[j] >= thr) j++;
@@ -215,12 +254,12 @@ function compute() {
   for (let i = 0; i < n; i++) load[i] = S.scope === 'ev' ? ev[i] : S.scope === 'home' ? S.kwh[i] - ev[i] : S.kwh[i];
 
   // 4. modelled solar, then an optional battery, simulated chronologically
-  const rg = c.roofs.map(r => ({ norm: makeRoofNorm(c.lat, c.lon, r.az, r.side, r.tilt), per: roofYield(r) }));
-  const gPer = rg.map(() => new Float64Array(n)); // one panel on each roof
-  const g = new Float64Array(n), month = new Uint8Array(n);
+  const gPer = c.roofs.map(r => faceSeries(r)); // one panel on each roof face
+  const gRaw = new Float64Array(n), g = new Float64Array(n), month = new Uint8Array(n), lim = clipLimit(c.inverter);
   for (let i = 0; i < n; i++) {
     month[i] = +S.date[i].slice(5, 7);
-    rg.forEach((r, k) => { const v = r.norm(S.t[i]) * r.per; gPer[k][i] = v; g[i] += v * c.roofs[k].panels; });
+    let v = 0; for (let k = 0; k < gPer.length; k++) v += gPer[k][i] * c.roofs[k].panels;
+    gRaw[i] = v; g[i] = Math.min(v, lim); // the inverter caps what reaches the house
   }
   const WINTER = [0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1]; // index = month number: Oct-Mar
   const SUMMER = [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0]; // Apr-Sep
@@ -278,37 +317,36 @@ function compute() {
   const sim = makeModel(g);
   const gridMode = c.gridCharge === 'off' ? 'off' : c.gridCharge;
   const { self, direct, bg, exp, imp, gch, bx } = sim(c.battery, gridMode, c.batExport);
-  const genTotal = g.reduce((a, v) => a + v, 0), annualise = genTotal ? c.annual / genTotal : 0;
-  const saving = r => { let v = 0; for (let i = 0; i < n; i++) v += (load[i] - r.imp[i]) * prate[i] / 100 + r.exp[i] * c.exportRate / 100; return v * annualise; };
+  const rawTotal = gRaw.reduce((a, v) => a + v, 0), annualise = rawTotal ? c.annual / rawTotal : 365.25 / (n / 48);
+  const saving = (r, ann = annualise) => { let v = 0; for (let i = 0; i < n; i++) v += (load[i] - r.imp[i]) * prate[i] / 100 + r.exp[i] * c.exportRate / 100; return v * ann; };
   const sum1 = a => a.reduce((x, y) => x + y, 0);
   // compare the two real products (each with its own inverter and efficiency), plus any custom setup
   const base = saving(sim(0, 'off'));
-  const options = Object.values(PRODUCTS).map(p => ({ name: `${p.name} (${nf(p.battery, 1)} kWh, ${p.batKw} kW)`, short: p.name, cap: p.battery, kw: p.batKw, eff: p.batEff, kwC: p.batKwCharge || p.batKw, warrMWh: p.warrMWh, price: p.cost + (c.panels - QUOTE_PANELS) * c.panelPrice }));
-  if (c.batModel === 'custom' && c.battery > 0) options.push({ name: `Custom (${nf(c.battery, 1)} kWh, ${c.batKw} kW)`, short: 'Custom', cap: c.battery, kw: c.batKw, kwC: c.batKwCharge, eff: c.batEff, price: +c.cost || 0 });
+  const mkOpt = cap => { const p = batPower(cap, c.inverter); return { name: `${nf(cap, 1)} kWh battery`, short: `${nf(cap, 1)} kWh`, cap, kw: p, eff: c.batEff, kwC: p, price: Math.abs(cap - c.battery) < 0.05 ? netCost(c) : 0 }; }; // only the system you priced has a price
+  const options = [...new Set([5, 10, 13.5, c.battery].filter(x => x > 0).map(x => +x.toFixed(2)))].sort((a, b) => a - b).map(mkOpt);
   const scen = options.map(o => {
     const run = (mode, ex) => sim(o.cap, mode, ex, o.kw, o.eff, o.kwC);
     const bat = run('off'), win = run('winter'), ex = run('winter', 'summer'), all = run('all');
-    // energy leaving the battery a year (to the house plus anything sold), for the warranty throughput check
-    const thruOf = r => (sum1(r.bg) + sum1(r.self) - sum1(r.direct) + sum1(r.bx)) * annualise;
-    const cr = sim(o.cap, gridMode, c.batExport, o.kw, o.eff, o.kwC), nr = sim(o.cap, gridMode, 'off', o.kw, o.eff, o.kwC);
+    const cr = sim(o.cap, gridMode, c.batExport, o.kw, o.eff, o.kwC);
     // peak-rate electricity still bought: with your settings, and if the battery is simply filled to 100% every night
     const peakOf = r => { let v = 0; for (let i = 0; i < n; i++) if (!off[i]) v += r.imp[i]; return v * annualise; };
     const fr = sim(o.cap, 'full', 'off', o.kw, o.eff, o.kwC);
-    return { ...o, cfg: saving(cr), thru: thruOf(cr), thruNoSell: thruOf(nr), peakCfg: peakOf(cr), peakFull: peakOf(fr), base, bat: saving(bat), win: saving(win), ex: saving(ex), all: saving(all),
+    return { ...o, cfg: saving(cr), peakCfg: peakOf(cr), peakFull: peakOf(fr), base, bat: saving(bat), win: saving(win), ex: saving(ex), all: saving(all),
       winKwh: sum1(win.bg) * annualise, exKwh: sum1(ex.bx) * annualise };
   });
-  // How many panels? Generation scales with panel count, so rerun the same model on a scaled profile.
-  // Fill roof 1 up to its capacity first, then put the rest on roof 2.
-  const cap1 = c.roofs[0].max || QUOTE_PANELS, y1 = roofYield(c.roofs[0]), y2 = roofYield(c.roofs[1]);
-  const panelCounts = [...new Set([4, 6, 8, 10, QUOTE_PANELS, 12, 14, 16, 18, 20, c.panels])].filter(x => x > 0).sort((a, b) => a - b);
+  // How many panels? Rerun the same model with other panel counts, filling the best roof face first.
+  const capTot = c.roofs.reduce((a, r) => a + r.max, 0), top = Math.max(capTot, c.panels), pstep = Math.max(1, Math.round(top / 10));
+  const panelCounts = [...new Set([...Array.from({ length: Math.floor(top / pstep) }, (_, i) => (i + 1) * pstep), c.panels, top])].filter(x => x > 0).sort((a, b) => a - b);
   const panelRes = panelCounts.map(np => {
-    const n1 = Math.min(np, cap1), n2 = np - n1;
-    const same = n1 === c.roofs[0].panels && n2 === c.roofs[1].panels;
-    const gs = same ? g : g.map((_, i) => n1 * gPer[0][i] + n2 * gPer[1][i]), mdl = same ? sim : makeModel(gs);
-    const solarOnly = saving(mdl(0, 'off')), run = c.battery > 0 ? mdl(c.battery, gridMode, c.batExport, c.batKw, c.batEff, c.batKwCharge) : mdl(0, 'off');
-    const full = c.battery > 0 ? saving(run) : solarOnly;
-    let used = 0, made = 0; for (let i = 0; i < n; i++) { used += run.self[i]; made += gs[i]; }
-    return { np, n1, n2, kwp: np * c.panelW / 1000, gen: n1 * y1 + n2 * y2, solarOnly, full, selfPct: made ? used / made : 0 };
+    const counts = allocPanels(c.roofs, np), same = counts.every((m, k) => m === c.roofs[k].panels);
+    let annual = 0; const raw = new Float64Array(n);
+    counts.forEach((m, k) => { if (m) { annual += m * roofYield(c.roofs[k]); for (let i = 0; i < n; i++) raw[i] += m * gPer[k][i]; } });
+    const rs = raw.reduce((a, v) => a + v, 0), ann = rs ? annual / rs : annualise;
+    const gs = same ? g : raw.map(v => Math.min(v, lim)), mdl = same ? sim : makeModel(gs);
+    const solarOnly = saving(mdl(0, 'off'), ann), run = c.battery > 0 ? mdl(c.battery, gridMode, c.batExport, c.batKw, c.batEff, c.batKwCharge) : mdl(0, 'off');
+    const full = c.battery > 0 ? saving(run, ann) : solarOnly;
+    let used = 0, made = 0, gsum = 0; for (let i = 0; i < n; i++) { used += run.self[i]; made += gs[i]; gsum += raw[i]; }
+    return { np, counts, kwp: np * c.panelW / 1000, gen: gsum ? annual * made / gsum : 0, solarOnly, full, selfPct: made ? used / made : 0 };
   });
   // The next 25 years, year by year: panels fade, the battery loses capacity, and unit rates follow the chosen trend
   // (from your own tariff's rate history, or a custom %). Each year reruns the model with that year's output, capacity and prices.
@@ -320,12 +358,14 @@ function compute() {
   finOpts.forEach(o => { yearsBy[o.name] = []; });
   for (let k = 0; k < 25; k++) {
     const kp = Math.max(0, 1 - c.deg / 100 * k), kb = Math.max(0.3, 1 - c.batDeg / 100 * k);
-    const mdl = k === 0 ? sim : makeModel(g.map(v => v * kp));
+    const mdl = k === 0 ? sim : makeModel(gRaw.map(v => Math.min(v * kp, lim)));
     const pk = peakNow * Math.pow(1 + gU, k), of = offNow * Math.pow(1 + gU, k), ex = c.exportRate * Math.pow(1 + gE, k);
     const val = r => { let v = 0; for (let i = 0; i < n; i++) v += (load[i] - r.imp[i]) * (off[i] ? of : pk) / 100 + r.exp[i] * ex / 100; return v * annualise; };
     yearsCfg.push(val(mdl(c.battery * kb, gridMode, c.batExport, c.batKw, c.batEff, c.batKwCharge)));
     finOpts.forEach(o => yearsBy[o.name].push(val(mdl(o.cap * kb, gridMode, c.batExport, o.kw, o.eff, o.kwC))));
   }
+  const loadSum = load.reduce((a, v) => a + v, 0);
+  S.ctx = { n, load, off, prate, makeModel, gU, gE, loadSum }; // lets the planner price a design without redoing everything above
   // 5. per-day aggregates
   const standing = R.standing; let si = 0;
   const stand = t => {
@@ -365,7 +405,14 @@ function compute() {
     cur.after += imp[i] * e; cur.expInc += exp[i] * c.exportRate / 100;
   }
   days.forEach(d => { d.full = d.n >= 44 ? 1 : 0; if (d.n < 44 || S.scope === 'ev') d.standing = 0; else d.standing /= 100; });
-  S.D = { rate, off, ev, load, g, self, exp, imp, days, scen, base, panelRes, yearsCfg, yearsBy, trendInfo: { gU, gE, hist, h: [hg(1), hg(2), hg(3)] }, standNow: days[days.length - 1].rawStand, peakAvg: peakNow, offAvg: offNow, min, max, tou, apiRates: fromApi > n * 0.5 };
+  // The rates in force right now, read from the tariff schedule at this moment (not averaged over your history).
+  const nowMs = Date.now(), valid = l => (l || []).filter(r => r[0] <= nowMs && (r[1] === null || r[1] > nowMs)).map(r => r[2]);
+  const vs = valid(R.rates), vd = valid(R.day), vn = valid(R.night), vst = valid(R.standing);
+  const today = { standing: vst.length ? vst[0] : null, code: ((R.meta || {}).tariffs || []).slice(-1)[0] || '' };
+  if (vs.length) { today.peak = Math.max(...vs); today.off = Math.min(...vs); } else if (vd.length && vn.length) { today.peak = vd[0]; today.off = vn[0]; }
+  if (today.peak === undefined) { today.peak = peakNow; today.off = offNow; today.estimated = true; } // no schedule available: latest rate in your data
+  today.tou = today.peak - today.off > 0.5;
+  S.D = { today, annualise, rate, off, ev, load, g, self, exp, imp, days, scen, base, panelRes, yearsCfg, yearsBy, trendInfo: { gU, gE, hist, h: [hg(1), hg(2), hg(3)] }, standNow: days[days.length - 1].rawStand, peakAvg: peakNow, offAvg: offNow, min, max, tou, apiRates: fromApi > n * 0.5 };
   if (!S.selDay || !days.some(d => d.date === S.selDay)) {
     const full = days.filter(d => d.n >= 46); S.selDay = (full[full.length - 1] || days[days.length - 1]).date;
   }
@@ -451,6 +498,7 @@ function tile(k, v, s, cls = '') {
 }
 
 function buildLayout() {
+  Planner.init($('#planner'));
   const U = '#usage', V = '#solar';
   mkCard(U, 'usage', 'Usage over time', { cls: 'wide' });
   mkCard(U, 'rates', 'Peak vs off-peak usage');
@@ -464,80 +512,51 @@ function buildLayout() {
   mkCard(U, 'top', 'Biggest days', { cls: 'wide', noTable: true });
   cards.top.plot.style.overflowX = 'auto';
 
-  const a = mkCard(V, 'assump', 'Your solar assumptions', { cls: 'wide', noTable: true });
+  const pf = mkCard(V, 'perf', 'System performance', { cls: 'wide', noTable: true });
+  pf.sub.textContent = 'How much of the sunlight on your panels becomes usable electricity. Enter your installer\'s figures to match their quote.';
+  pf.plot.innerHTML = `<div class="assump">
+    <label>System total losses (%)<input id="aSL" type="number" step="0.1" min="0" max="60"></label>
+    <label>Inverter losses (%)<input id="aIL" type="number" step="0.1" min="0" max="60"></label>
+    <label>Optimizer losses (%)<input id="aOL" type="number" step="0.1" min="0" max="60"></label>
+    <label>Extra shading losses (%)<input id="aShL" type="number" step="0.1" min="0" max="90"></label>
+    <label>Performance adjustment (%)<input id="aPA" type="number" step="0.1" min="-50" max="50"></label></div>
+    <p class="hint" id="perfNote"></p>
+    <p class="hint">System losses cover soiling, wiring, mismatch and panel ageing; inverter and optimizer losses are their own conversion losses. Shading here is an overall allowance on top of the shading you choose for each roof face. The performance adjustment is a plus or minus correction (an installer's calibration, say). A quote's own estimate may use a different calculator (such as the System Advisor Model or PVGIS), so small differences are normal. Roof direction and pitch are set in the planner: a lean-to roof takes an exact compass direction, for example 232° and a 30° slope.</p>`;
+  const perfNote = () => { const c = S.cfg, f = lossFactor(c), ideal = kkEstimate(c.lat, c.lon, 0, 35) * f; $('#perfNote').innerHTML = `Combined, these take <b>${nf((1 - f) * 100, 1)}%</b> off the sunlight on the panels: a south-facing 35° roof at your location would make about <b>${nf(ideal, 0)} kWh per kWp</b> a year.`; };
+  const a = mkCard(V, 'assump', 'Assumptions', { cls: 'wide', noTable: true });
   a.plot.innerHTML = `<div class="assump">
-    <label>Panel size (W)<input id="aW" type="number" min="100" step="5"></label>
-    <label>Estimated generation (kWh/yr)<input id="aGen" type="text" disabled></label>
     <label>Export rate (p/kWh)<input id="aExp" type="number" min="0" step="0.5"></label>
-    <label>Battery<select id="aModel"><option value="evo10">Fox EVO 10 (9.7 kWh, 5 kW inverter)</option><option value="evo5">Fox EVO 5 (4.9 kWh, 3.68 kW inverter)</option><option value="pw3">Tesla Powerwall 3 (13.5 kWh, 11.04 kW inverter)</option><option value="custom">Custom</option></select></label>
-    <label>Battery usable size (kWh, 0 = none)<input id="aBat" type="number" min="0" step="0.5"></label>
-    <label>System cost (£)<input id="aCost" type="number" min="0" step="100" placeholder="for payback"></label>
-    <label>Finance term (years, 0 = cash)<input id="aTerm" type="number" min="0" max="25" step="1"></label>
-    <label>Finance APR (%)<input id="aApr" type="number" min="0" step="0.1"></label>
-    <label>Energy price trend<select id="aTrend"><option value="flat">Flat (today's prices)</option><option value="h1">Last 12 months of your rate history</option><option value="h2">Last 2 years of your rate history</option><option value="h3">Last 3 years of your rate history</option><option value="custom">Custom % a year</option></select></label>
     <label>Charge battery from grid off-peak<select id="aGrid"><option value="off">No (solar only)</option><option value="winter">Winter months (Oct–Mar)</option><option value="all">All year</option></select></label>
-    <label>Sell battery to grid at export rate<select id="aBx"><option value="off">No</option><option value="summer">Summer months (Apr–Sep)</option><option value="all">All year</option></select></label></div>
-    <div class="roofs" id="roofs"></div>
+    <label>Sell battery to grid at export rate<select id="aBx"><option value="off">No</option><option value="summer">Summer months (Apr–Sep)</option><option value="all">All year</option></select></label>
+    <label>Energy price trend<select id="aTrend"><option value="flat">Flat (today's prices)</option><option value="h1">Last 12 months of your rate history</option><option value="h2">Last 2 years of your rate history</option><option value="h3">Last 3 years of your rate history</option><option value="custom">Custom % a year</option></select></label></div>
     <p class="hint" id="trendHint"></p>
     <details><summary>Advanced</summary><div class="assump">
-    <label>Latitude<input id="aLat" type="number" step="0.1"></label>
-    <label>Longitude<input id="aLon" type="number" step="0.1"></label>
-    <label>EV detection threshold (kWh per half hour)<input id="aEv" type="number" step="0.1" min="0.5"></label>
-    <label>Fallback peak rate (p/kWh)<input id="aPeak" type="number" step="0.1"></label>
-    <label>Fallback off-peak rate (p/kWh)<input id="aOff" type="number" step="0.1"></label>
-    <label>Fallback standing charge (p/day)<input id="aStand" type="number" step="0.1"></label>
-    <label>Cost per panel added or removed (£)<input id="aPP" type="number" step="10" min="0"></label>
-    <label>Battery discharge power (kW)<input id="aKw" type="number" step="0.1" min="0.5"></label>
-    <label>Battery charge power (kW)<input id="aKwC" type="number" step="0.1" min="0.5"></label>
+    <label>Battery round-trip efficiency (%)<input id="aEff" type="number" step="1" min="50" max="100"></label>
     <label>Panel degradation (% a year)<input id="aDeg" type="number" step="0.1" min="0"></label>
+    <label>Battery capacity loss (% a year)<input id="aBd" type="number" step="0.1" min="0"></label>
     <label>Custom price change (% a year)<input id="aEsc" type="number" step="0.5"></label>
     <label>Export rate change (% a year)<input id="aXe" type="number" step="0.5"></label>
-    <label>Battery capacity loss (% a year)<input id="aBd" type="number" step="0.1" min="0"></label>
-    <label>Battery round-trip efficiency (%)<input id="aEff" type="number" step="1" min="50" max="100"></label></div>
-    <p class="hint">Fallback rates are only used when Octopus tariff rates can't be fetched. The battery discharges only when power is at the peak rate. With grid charging on, it charges overnight at the off-peak rate only as far as tomorrow's shortfall after solar needs (it is assumed to forecast your usage well). Battery presets follow the Fox ESS datasheets: EVO 10 = 10.24 kWh × 95% depth of discharge = 9.73 kWh usable, 5 kW inverter, ~94% round trip; EVO 5 = 5.12 kWh = 4.86 kWh usable, 3.68 kW inverter, ~90% round trip. Panels follow the JA Solar 455 W datasheet (0.4% a year degradation); the quote is 11 panels for 4,359 kWh a year, and other panel counts scale that linearly. The £400 per panel added or removed is a placeholder, so replace it with your installer's figure. Battery capacity fades 2% a year by default (the datasheet's 6,000-cycle life is about 16 years of daily cycling; that is my estimate, not a datasheet figure). Selling to the grid fills the battery off-peak, covers your home use first, and exports the rest at the export rate; check your export tariff allows battery export.</p></details>`;
-  const f = (id, label, inner) => `<label>${label}${inner}</label>`;
-  const num = (id, min, max, step) => `<input id="${id}" type="number" inputmode="decimal" min="${min}" max="${max}" step="${step}">`;
-  $('#roofs').innerHTML = ['Roof 1', 'Roof 2'].map((nm, k) => {
-    const r = `r${k + 1}`;
-    return `<div class="roof"><div class="rn" id="${r}n">${nm}</div><div class="rg">` +
-      f(r + 'p', 'Panels', num(r + 'p', 0, 60, 1)) + f(r + 'max', 'Space (max panels)', num(r + 'max', 0, 60, 1)) +
-      f(r + 'az', 'Orientation (° from south)', num(r + 'az', 0, 180, 5)) +
-      f(r + 'side', 'Faces', `<select id="${r}side"><option value="E">East</option><option value="W">West</option></select>`) +
-      f(r + 'tilt', 'Roof pitch (°)', num(r + 'tilt', 0, 90, 1)) + f(r + 'shade', 'Shade factor', num(r + 'shade', 0.1, 1, 0.01)) +
-      f(r + 'kk', 'Irradiance Kk (kWh/kWp)', num(r + 'kk', 100, 1200, 1)) +
-      f(r + 'gen', 'Generation (kWh/yr)', `<input id="${r}gen" type="text" disabled>`) + '</div></div>';
-  }).join('') + `<p class="hint" style="margin:2px 0 0">0° = due south, 90° = east or west, 180° = north. Kk is the installer's irradiance figure; changing orientation or pitch re-estimates it, and you can overwrite it with the figure from your quote. Generation = panels × panel size × Kk × shade factor. Roof 1 matches the Octopus quote (11 panels, 4,359 kWh). The panel comparison fills roof 1 first, then roof 2; roof 2 is off at 0 panels.</p>`;
-  let rtimer;
-  S.cfg.roofs.forEach((r, k) => {
-    for (const [suf, key] of Object.entries({ p: 'panels', max: 'max', az: 'az', side: 'side', tilt: 'tilt', shade: 'shade', kk: 'kk' })) {
-      const el = $(`#r${k + 1}${suf}`); el.value = r[key];
-      el.oninput = () => {
-        r[key] = el.tagName === 'SELECT' ? el.value : (+el.value || 0);
-        if (key === 'az' || key === 'tilt') { r.kk = kkEstimate(S.cfg.lat, S.cfg.lon, r.az, r.tilt); $(`#r${k + 1}kk`).value = r.kk; }
-        syncCfg(); if (key === 'panels') syncCost(); saveCfg();
-        clearTimeout(rtimer); rtimer = setTimeout(() => { compute(); render(); }, 200);
-      };
-    }
-  });
-  const bind = { aW: 'panelW', aPP: 'panelPrice', aExp: 'exportRate', aBat: 'battery', aCost: 'cost', aLat: 'lat', aLon: 'lon', aEv: 'evThr', aGrid: 'gridCharge', aBx: 'batExport', aKw: 'batKw', aKwC: 'batKwCharge', aDeg: 'deg', aEsc: 'escal', aXe: 'exportEscal', aBd: 'batDeg', aTrend: 'trend', aEff: 'batEff', aModel: 'batModel', aTerm: 'term', aApr: 'apr',
-    aPeak: 'peak', aOff: 'offpeak', aStand: 'standing' };
-  let timer;
+    <label>EV detection threshold (kWh per half hour)<input id="aEv" type="number" step="0.1" min="0.5"></label>
+    <label>Fallback unit rate (p/kWh)<input id="aPeak" type="number" step="0.1"></label>
+    <label>Fallback off-peak rate (p/kWh)<input id="aOff" type="number" step="0.1"></label>
+    <label>Fallback standing charge (p/day)<input id="aStand" type="number" step="0.1"></label></div>
+    <p class="hint">The tool does not estimate installation costs: enter your installer's price in the planner (or save quotes) to see payback. Fallback rates are only used when your Octopus tariff rates can't be fetched. The battery discharges only when power is at the peak rate. With grid charging on, it charges overnight at the off-peak rate only as far as tomorrow's shortfall after solar needs (it is assumed to forecast your usage well). Battery power is half a kW per kWh, limited by the inverter. Battery capacity fades 2% a year by default. Selling to the grid fills the battery off-peak, covers your home use first, and exports the rest at the export rate; check your export tariff allows battery export.</p></details>`;
+  const fc = mkCard(V, 'finopts', 'Finance (optional)', { cls: 'wide', noTable: true });
+  fc.sub.textContent = 'Only used if you enter an installer price above: it shapes the finance table and chart below';
+  fc.plot.innerHTML = `<div class="assump">
+    <label>Loan term (years, 0 = pay in cash)<input id="aTerm" type="number" min="0" max="25" step="1"></label>
+    <label>Loan APR (%)<input id="aApr" type="number" min="0" step="0.1"></label></div>
+    <p class="hint">With a term above 0, the finance table and chart show the monthly payment, total interest and when the savings overtake the repayments. Leave at 0 to compare the price as a cash purchase.</p>`;
+  const bind = { aExp: 'exportRate', aGrid: 'gridCharge', aBx: 'batExport', aTrend: 'trend', aTerm: 'term', aApr: 'apr',
+    aSL: 'sysLoss', aIL: 'invLoss', aOL: 'optLoss', aShL: 'shadeLoss', aPA: 'perfAdj', aEff: 'batEff', aDeg: 'deg', aBd: 'batDeg', aEsc: 'escal', aXe: 'exportEscal', aEv: 'evThr', aPeak: 'peak', aOff: 'offpeak', aStand: 'standing' };
   for (const [id, key] of Object.entries(bind)) {
     const inp = $('#' + id); inp.value = S.cfg[key];
     inp.oninput = () => {
-      if (['battery', 'batKw', 'batKwCharge', 'batEff'].includes(key)) { S.cfg.batModel = 'custom'; $('#aModel').value = 'custom'; }
-      const v = inp.tagName === 'SELECT' ? inp.value : inp.value === '' ? (key === 'cost' ? '' : DEF[key]) : +inp.value;
-      S.cfg[key] = v;
-      if (key === 'panelPrice' || key === 'panelW') { syncCfg(); if (key === 'panelPrice') syncCost(); }
-      if (key === 'batModel' && PRODUCTS[v]) {
-        Object.assign(S.cfg, { battery: PRODUCTS[v].battery, batKw: PRODUCTS[v].batKw, batKwCharge: PRODUCTS[v].batKwCharge || PRODUCTS[v].batKw, batEff: PRODUCTS[v].batEff });
-        S.cfg.cost = PRODUCTS[v].cost + (S.cfg.panels - QUOTE_PANELS) * S.cfg.panelPrice; $('#aCost').value = Math.round(S.cfg.cost);
-        $('#aBat').value = S.cfg.battery; $('#aKw').value = S.cfg.batKw; $('#aKwC').value = S.cfg.batKwCharge; $('#aEff').value = S.cfg.batEff;
-      }
-      saveCfg();
-      clearTimeout(timer); timer = setTimeout(() => { compute(); render(); }, 200);
+      S.cfg[key] = inp.tagName === 'SELECT' ? inp.value : inp.value === '' ? DEF[key] : +inp.value;
+      saveCfg(); perfNote(); Planner.changed(false);
     };
   }
+  perfNote();
   const t = document.createElement('div'); t.className = 'card tilesrow'; t.innerHTML = '<div class="tiles" id="solarTiles"></div>';
   $(V).appendChild(t);
   mkCard(V, 'gen', 'Solar generation vs your usage', { cls: 'wide', extra:
@@ -551,6 +570,7 @@ function buildLayout() {
   mkCard(V, 'batcmp', 'Is a battery worth it?');
   mkCard(V, 'panels', 'How many panels?', { cls: 'wide' });
   mkCard(V, 'fin', 'Cost vs savings over 25 years', { cls: 'wide' });
+  cards.fin.el.before(cards.finopts.el); // the finance inputs sit just above the finance chart they drive
   mkCard(V, 'dayx', 'Pick any day', { cls: 'wide', extra:
     '<div class="daybar"><button class="btn" id="dPrev">‹</button><input type="date" id="dPick"><button class="btn" id="dNext">›</button></div>' });
   $('#cPrev').onclick = () => { S.calMonth = shiftMonth(-1); renderCal(); };
@@ -609,11 +629,12 @@ function render() {
   $('#kpis').innerHTML =
     tile(`Used · ${scopeShort}`, `${nf(T.load, 0)}<small>kWh</small>`, `${nf(T.load / nd, 1)} kWh a day over ${nd} days`) +
     tile(`Bill · ${scopeShort}`, gbp(bill), `${gbp(bill / nd)} a day` + (T.standing ? ` · ${gbp(T.standing)} standing charge` : ' · energy only')) +
-    tile('Average unit price', T.load ? `${nf(T.lcost / T.load * 100, 1)}<small>p/kWh</small>` : '—',
-      S.D.tou && T.load ? `${pct(T.loff / T.load)} at the off-peak rate` : 'Flat-rate tariff') +
-    tile('EV charging', `${nf(T.ev, 0)}<small>kWh</small>`,
-      T.ev ? `${gbp(T.costEv)} · ${nf(T.costEv / T.ev * 100, 1)}p/kWh · ${pct(T.ev / T.kwh)} of all usage` : 'No EV charging detected') +
-    tile('Home (excluding EV)', `${nf(T.home / nd, 1)}<small>kWh/day</small>`, `${gbp(T.costHome / nd)} a day in energy`);
+    tile('Unit rate today', `${nf(S.D.today.peak, 1)}<small>p/kWh</small>`,
+      (S.D.today.tou ? `Off-peak ${nf(S.D.today.off, 1)}p` : 'Flat rate') + ` · standing charge ${nf(S.D.today.standing === null ? S.D.standNow : S.D.today.standing, 1)}p a day` +
+      (S.D.today.code ? ` · ${esc(S.D.today.code)}` : '') + (S.D.today.estimated ? ' (latest in your data)' : '')) +
+    (S.hasEv ? tile('EV charging', `${nf(T.ev, 0)}<small>kWh</small>`,
+      T.ev ? `${gbp(T.costEv)} · ${nf(T.costEv / T.ev * 100, 1)}p/kWh · ${pct(T.ev / T.kwh)} of all usage` : 'No EV charging detected') : '') +
+    tile(S.hasEv ? 'Home (excluding EV)' : 'Daily average', `${nf(T.home / nd, 1)}<small>kWh/day</small>`, `${gbp(T.costHome / nd)} a day in energy`);
 
   // usage charts
   const homeS = (vals, type) => ({ name: 'Home', color: 'var(--c-home)', values: vals, type });
@@ -666,14 +687,14 @@ function renderSolar(vd, T, nd, groups, labels, tipTitles, per, P, hours) {
   const c = S.cfg, all = S.D.days, A = totals(all);
   const [scopeName, scopeShort] = SCOPE[S.scope];
   const saved = (T.pcost - T.pafter) + T.expInc, billBefore = T.pcost + T.standing, billAfter = T.pafter + T.standing - T.expInc;
-  const annualSave = A.gen ? ((A.pcost - A.pafter) + A.expInc) * c.annual / A.gen : 0;
+  const annualSave = A.gen ? ((A.pcost - A.pafter) + A.expInc) * S.D.annualise : 0;
   // 25-year outlook from the year-by-year model (panel and battery degradation, price trend)
   const yrs = Array.from({ length: 25 }, (_, i) => i + 1);
   const life = []; let cum = 0, payYear = null;
   for (const y of yrs) {
     const v = S.D.yearsCfg[y - 1];
     cum += v; life.push({ y, v, cum });
-    if (payYear === null && c.cost > 0 && cum >= c.cost) payYear = y - 1 + (c.cost - (cum - v)) / v;
+    if (payYear === null && netCost(c) > 0 && cum >= netCost(c)) payYear = y - 1 + (netCost(c) - (cum - v)) / v;
   }
   const payback = payYear;
   $('#solarTiles').innerHTML =
@@ -682,7 +703,7 @@ function renderSolar(vd, T, nd, groups, labels, tipTitles, per, P, hours) {
     tile('Share of ' + scopeName + ' covered', pct(T.load ? (T.self + T.bg) / T.load : 0), `${kwh(Math.max(0, T.load - T.self - T.bg))} still bought from the grid`) +
     tile('Saved at today\'s prices', gbp(saved), `Bill ${gbp(billBefore)} → ${gbp(billAfter)}`) +
     tile('Projected saving per year', gbp(annualSave), `From ${all.length} days of your data${all.length < 330 ? ' (scaled to a full year)' : ''}`, 'hero') +
-    tile('Payback', payback ? `${nf(payback, 1)}<small>years</small>` : '—', payback ? `On a ${gbp(c.cost)} system` : c.cost > 0 ? 'Not within 25 years' : 'Add a system cost above') +
+    tile('Payback', payback ? `${nf(payback, 1)}<small>years</small>` : '—', payback ? `On a ${gbp(netCost(c))} system` : netCost(c) > 0 ? 'Not within 25 years' : 'Enter your price in the planner') +
     tile('Saved over 25 years', gbp(cum), `Panels −${c.deg}%/yr, battery −${c.batDeg}%/yr, unit rates ${S.D.trendInfo.gU ? (S.D.trendInfo.gU > 0 ? '+' : '') + nf(S.D.trendInfo.gU * 100, 1) + '%/yr' : 'flat'}`);
 
   // Supply stack: everything below the usage line is what meets your usage (solar, battery, grid);
@@ -725,17 +746,17 @@ function renderSolar(vd, T, nd, groups, labels, tipTitles, per, P, hours) {
     Charts.table(['Battery', 'Solar alone', '+ stores solar', '+ off-peak Oct–Mar', '+ summer export', '+ off-peak all year (no export)', 'Sold to grid (summer)'],
       [['No battery', gbp(D.base), '', '', '', '', ''], ...sc.map(x => [x.name, gbp(D.base), gbp(x.bat), gbp(x.win), gbp(x.ex), gbp(x.all), kwh(x.exKwh, 0)])]));
   // Panel count comparison: saving by number of panels, with the marginal value of each extra panel
-  const pr = D.panelRes, pcash = x => c.cost + (x.np - c.panels) * c.panelPrice, r1 = compass(c.roofs[0].az, c.roofs[0].side), r2 = compass(c.roofs[1].az, c.roofs[1].side);
-  chart('panels', `Projected saving a year by total panels (first ${c.roofs[0].max} on the ${r1} roof, extras on the ${r2} roof) · ${c.battery > 0 ? nf(c.battery, 2) + ' kWh battery' : 'no battery'} · your quote is ${QUOTE_PANELS} panels`,
-    { title: 'Panels', labels: pr.map(x => String(x.np)), tipTitles: pr.map(x => `${x.np} panels${x.n2 ? ` (${x.n1} ${r1} + ${x.n2} ${r2})` : ''} · ${nf(x.kwp, 1)} kWp · ${nf(x.gen, 0)} kWh a year`), unit: '£ a year', valFmt: gbp,
+  const pr = D.panelRes, split = x => c.roofs.map((r, k) => x.counts[k] ? `${x.counts[k]} ${r.name}` : '').filter(Boolean).join(' + ');
+  chart('panels', `Projected saving a year by total panels (best roof face filled first) · ${c.battery > 0 ? nf(c.battery, 2) + ' kWh battery' : 'no battery'} · ${nf(c.inverter, 1)} kW inverter`,
+    { title: 'Panels', labels: pr.map(x => String(x.np)), tipTitles: pr.map(x => `${x.np} panels (${split(x)}) · ${nf(x.kwp, 1)} kWp · ${nf(x.gen, 0)} kWh a year`), unit: '£ a year', valFmt: gbp,
       yFmt: v => nf(v, 0), totalLabel: 'Total saving a year', height: 240,
       series: [{ name: 'Solar alone', color: 'var(--c-solar)', values: pr.map(x => x.solarOnly) },
         { name: 'Battery adds', color: 'var(--c-batt)', values: pr.map(x => Math.max(0, x.full - x.solarOnly)) }] },
-    Charts.table(['Panels', 'kWp', 'kWh a year', 'Saving a year', 'Price'], pr.map(x => [x.np, nf(x.kwp, 2), nf(x.gen, 0), gbp(x.full), gbp(pcash(x))])));
-  cards.panels.ramp.innerHTML = '<div class="tblwrap" style="max-height:none"><table><thead><tr><th>Panels</th><th>Total size</th><th>Generation</th><th>Used at home</th><th>Saving a year</th><th>Extra per added panel</th><th>Price</th><th>Cash payback</th></tr></thead><tbody>' +
+    Charts.table(['Panels', 'kWp', 'kWh a year', 'Saving a year'], pr.map(x => [x.np, nf(x.kwp, 2), nf(x.gen, 0), gbp(x.full)])));
+  cards.panels.ramp.innerHTML = '<div class="tblwrap" style="max-height:none"><table><thead><tr><th>Panels</th><th>Total size</th><th>Generation</th><th>Used at home</th><th>Saving a year</th><th>Extra per added panel</th></tr></thead><tbody>' +
     pr.map((x, i) => {
       const prev = pr[i - 1], marg = prev ? (x.full - prev.full) / (x.np - prev.np) : null;
-      return `<tr${x.np === c.panels ? ' style="font-weight:650"' : ''}><td>${x.np}${x.n2 ? ` <small>(${x.n1} ${r1} + ${x.n2} ${r2})</small>` : ''}${x.np === c.panels ? ' ◂ selected' : x.np === QUOTE_PANELS ? ' (quote)' : ''}</td><td>${nf(x.kwp, 1)} kWp</td><td>${nf(x.gen, 0)} kWh</td><td>${pct(x.selfPct)}</td><td>${gbp(x.full)}</td><td>${marg === null ? '' : gbp(marg) + ' a year'}</td><td>${gbp(pcash(x))}</td><td>${x.full > 0 ? nf(pcash(x) / x.full, 1) + ' years' : ''}</td></tr>`;
+      return `<tr${x.np === c.panels ? ' style="font-weight:650"' : ''}><td>${x.np} <small>(${split(x)})</small>${x.np === c.panels ? ' ◂ selected' : ''}</td><td>${nf(x.kwp, 1)} kWp</td><td>${nf(x.gen, 0)} kWh</td><td>${pct(x.selfPct)}</td><td>${gbp(x.full)}</td><td>${marg === null ? '' : gbp(marg) + ' a year'}</td></tr>`;
     }).join('') + '</tbody></table></div>';
   // Finance: a loan at the quoted APR (monthly rate = (1+APR)^(1/12)-1), paid over `term` years, against yearly savings
   const finance = (price, years) => {
@@ -768,10 +789,6 @@ function renderSolar(vd, T, nd, groups, labels, tipTitles, per, P, hours) {
       trow('Net position after 25 years', x => gbp(x.f.net)) +
       trow('Peak-rate electricity still bought a year (your settings)', x => `${nf(x.peakCfg, 0)} kWh · ${gbp(x.peakCfg * D.peakAvg / 100)}`) +
       trow('Peak-rate electricity still bought, battery filled to 100% every night', x => `${nf(x.peakFull, 0)} kWh · ${gbp(x.peakFull * D.peakAvg / 100)}`) +
-      trow('Warranty: battery energy out a year (your settings)', x => `${nf(x.thru, 0)} kWh`) +
-      trow('Warranty: throughput vs the datasheet limit over the warranty', x => x.warrMWh ? `${nf(x.thru * 12 / 1000, 1)} of ${x.warrMWh} MWh (${pct(x.thru * 12 / 1000 / x.warrMWh)})` : '—') +
-      trow('Warranty: same, if you never sell to the grid', x => x.warrMWh ? `${nf(x.thruNoSell * 12 / 1000, 1)} of ${x.warrMWh} MWh (${pct(x.thruNoSell * 12 / 1000 / x.warrMWh)})` : '—') +
-      trow('Warranty: capacity at year 12 vs 70% guarantee', x => `${pct(Math.max(0, 1 - c.batDeg / 100 * 12))} (assumed ${c.batDeg}% a year loss)`) +
       '</tbody></table></div>';
     chart('fin', `Cumulative £ after repayments: below zero you are still paying the system off · ${c.term ? c.term + '-year finance at ' + c.apr + '% APR' : 'bought in cash'} · panels −${c.deg}% a year, battery capacity −${c.batDeg}% a year, unit rates ${D.trendInfo.gU ? (D.trendInfo.gU > 0 ? '+' : '') + nf(D.trendInfo.gU * 100, 1) + '% a year' : 'held flat'}${D.trendInfo.gE ? ', export ' + (D.trendInfo.gE > 0 ? '+' : '') + nf(D.trendInfo.gE * 100, 1) + '% a year' : ''}`,
       { title: 'Cumulative position', labels: yrs.map(y => 'Yr ' + y), tipTitles: yrs.map(y => 'End of year ' + y), unit: '£', yFmt: v => nf(v, 0), valFmt: gbp,
@@ -779,7 +796,7 @@ function renderSolar(vd, T, nd, groups, labels, tipTitles, per, P, hours) {
         series: fo.map((x, i) => ({ name: x.short, color: colours[i % 3], type: 'line', values: x.f.rows.map(r => r.cum) })) },
       Charts.table(['Year', ...fo.flatMap(x => [x.short + ' saving', x.short + ' paid', x.short + ' cumulative'])],
         yrs.map((y, i) => ['Year ' + y, ...fo.flatMap(x => [gbp(x.f.rows[i].sv), gbp(x.f.rows[i].pay), gbp(x.f.rows[i].cum)])])));
-  } else { cards.fin.plot.innerHTML = '<p class="hint">Enter a system cost above to see finance and payback.</p>'; }
+  } else { cards.fin.plot.innerHTML = '<p class="hint">Enter your installer\'s price in the planner above to see finance and payback.</p>'; }
   cards.insights.sub.textContent = 'Calculated from your data in this period';
   cards.insights.plot.innerHTML = '<ul class="insights">' + insights(vd, T, groups).map(i => `<li class="${i[0]}">${i[1]}</li>`).join('') + '</ul>';
 }
@@ -925,7 +942,7 @@ function renderBills() {
   $('#billTbl').innerHTML = `<table style="margin-top:10px"><thead><tr><th>${S.billSel === 'avg' || S.billSel === 'winter' || S.billSel === 'summer' ? 'Per month' : 'Month'} (${nf(b.dayN, b.dayN % 1 ? 1 : 0)} days)</th><th>Before solar</th><th>After solar + ${nf(c.battery, 1)} kWh battery</th></tr></thead><tbody>` +
     row(`Peak-rate electricity (${nf(pk, 1)}p/kWh)`, L(b.B.peak, pk), L(b.A.peak, pk)) +
     row(`Off-peak: home, overnight (${nf(off, 1)}p/kWh)`, L(b.B.home, off), L(b.A.home, off)) +
-    row(`Off-peak: car charging (${nf(off, 1)}p/kWh)`, L(b.B.car, off), L(b.A.car, off)) +
+    (S.hasEv ? row(`Off-peak: car charging (${nf(off, 1)}p/kWh)`, L(b.B.car, off), L(b.A.car, off)) : '') +
     row(`Off-peak: charging the battery (${nf(off, 1)}p/kWh)`, dash, c.battery > 0 ? L(b.A.chg, off) : dash) +
     row(`Standing charge (${nf(b.dayN, b.dayN % 1 ? 1 : 0)} days × ${nf(D.standNow, 2)}p)`, gbp(b.st), gbp(b.st)) +
     row(`Export income: solar (${c.exportRate}p/kWh)`, dash, '−' + nf(b.A.sExp, 0) + ' kWh · ' + gbp(b.A.sExp * c.exportRate / 100)) +
@@ -970,6 +987,9 @@ async function loadData(refresh = false) {
       if (body.error === 'not_configured') { $('#source').textContent = 'Not connected'; return openSetup(); }
       throw new Error(body.error);
     }
+    const m0 = body.meta; S.hasEv = m0.demo || m0.ev !== false; // the EV filter only goes for accounts the server found to have no EV or charger; an unknown answer (older server or cache) keeps it
+    if (!S.hasEv) S.scope = 'home';
+    $('#scope').hidden = !S.hasEv; $('#evFoot').hidden = !S.hasEv; $('#aEv').closest('label').hidden = !S.hasEv;
     ingest(body); compute();
     const m = body.meta, last = S.date[S.date.length - 1];
     $('#source').textContent = m.demo ? 'Demo data (synthetic)' : `${m.account} · to ${last}`;
@@ -978,6 +998,7 @@ async function loadData(refresh = false) {
     if (m.demo) warn.push('You are looking at <strong>synthetic demo data</strong>. Click <em>Connection</em> to use your own account.');
     notice(warn.join('<br>'));
     render();
+    Planner.onData();
   } catch (e) {
     $('#source').textContent = 'Error';
     notice('Could not load data: ' + Charts.esc(e.message));
@@ -1043,9 +1064,7 @@ if (new URLSearchParams(location.search).get('bill')) S.billSel = new URLSearchP
 if (new URLSearchParams(location.search).get('trend')) S.cfg.trend = new URLSearchParams(location.search).get('trend');
 if (new URLSearchParams(location.search).get('bx')) S.cfg.batExport = new URLSearchParams(location.search).get('bx');
 for (const k of ['term', 'apr']) if (new URLSearchParams(location.search).get(k)) S.cfg[k] = +new URLSearchParams(location.search).get(k);
-if (new URLSearchParams(location.search).get('roof2')) S.cfg.roofs[1].panels = +new URLSearchParams(location.search).get('roof2');
 if (new URLSearchParams(location.search).get('range')) S.range = new URLSearchParams(location.search).get('range');
-if (new URLSearchParams(location.search).get('bat')) S.cfg.battery = +new URLSearchParams(location.search).get('bat');
 if (['home', 'ev', 'both'].includes(new URLSearchParams(location.search).get('scope'))) S.scope = new URLSearchParams(location.search).get('scope');
 buildLayout();
 seg('#genUnit', () => S.genUnit, v => { S.genUnit = v; localStorage.setItem('octo.genUnit', v); });

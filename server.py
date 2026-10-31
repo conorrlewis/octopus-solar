@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -39,6 +39,7 @@ ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 CONFIG_FILE = ROOT / "config.json"
 CACHE_FILE = ROOT / "cache.json"
+PROPERTY_FILE = ROOT / "property.json"  # geocoded address and building outlines, so each is looked up once
 CACHE_TTL = 30 * 60  # seconds
 LOCK = threading.Lock()
 LAN = False  # set by --lan: listen on the local network instead of only this computer
@@ -164,6 +165,27 @@ def discover(account, key):
     }
 
 
+def ev_configured(account, key, tariffs):
+    """Does this account have an EV or EV charger set up? Octopus lists connected smart-charge devices in its GraphQL API;
+    Intelligent Octopus Go, which needs a connected car or charger, is a second sign. Returns (bool, why)."""
+    if any(("INTELLI" in t or "-IOG-" in t) for t in tariffs):
+        return True, "an Intelligent Octopus tariff"
+    gql = API + "/graphql/"
+    try:
+        def post(body, token=None):
+            h = {"Content-Type": "application/json", **({"Authorization": token} if token else {})}
+            return ext_json(gql, json.dumps(body).encode(), timeout=15, headers=h)
+        tok = post({"query": "mutation($k:String!){obtainKrakenToken(input:{APIKey:$k}){token}}", "variables": {"k": key}})
+        token = tok["data"]["obtainKrakenToken"]["token"]
+        res = post({"query": "query($a:String!){devices(accountNumber:$a){deviceType}}", "variables": {"a": account}}, token)
+        kinds = {d.get("deviceType") for d in (res.get("data") or {}).get("devices") or []}
+        if kinds & {"ELECTRIC_VEHICLES", "CHARGE_POINTS"}:
+            return True, "a connected EV or charger"
+    except (ApiError, KeyError, TypeError):
+        pass  # unknown: treated as no EV, so nothing is wrongly split out of your usage
+    return False, ""
+
+
 def price_history(info, now):
     """12-month average peak / off-peak unit rates and standing charge, for the last four years, stitched across
     the products on the account (the most recently launched product wins at any date)."""
@@ -283,13 +305,186 @@ def fetch_octopus(cfg, days):
     except Exception as e:  # history is a nice-to-have; never block the dashboard on it
         history = []
         warnings.append("Rate history unavailable (%s)" % e)
+    ev, ev_why = ev_configured(account, key, tariffs)
     return {
-        "meta": {"demo": False, "account": account, "mpan": info["mpan"],
+        "meta": {"demo": False, "account": account, "mpan": info["mpan"], "ev": ev, "evWhy": ev_why,
                  "tariffs": tariffs, "warnings": warnings,
                  "fetchedAt": ms(now)},
         "consumption": consumption, "rates": rates, "day": day, "night": night,
         "standing": standing, "history": history,
     }
+
+
+# ------------------------------------------------------- address and roof ----
+# The address comes from your Octopus account. To put it on a map it is sent to OpenStreetMap's Nominatim (falling
+# back to postcodes.io, which only sees the postcode), and building outlines are fetched from OpenStreetMap's Overpass
+# API for the area around the point. Nothing else leaves this computer, and every answer is cached in property.json.
+NOMINATIM = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REV = "https://nominatim.openstreetmap.org/reverse"
+POSTCODES = "https://api.postcodes.io/postcodes/"
+OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
+POSTCODE_RE = re.compile(r"^[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}$")
+DEMO_PLACE = {"lat": 51.76003, "lon": -1.20993, "label": "Demo location (a semi-detached house in Headington, Oxford): search for your own postcode",
+              "source": "demo"}
+GEO_MEM = {}
+
+
+def ext_json(url, data=None, timeout=25, headers=None):
+    """GET (or POST data to) a JSON API."""
+    req = Request(url, data=data, headers={"Accept": "application/json",
+                                           "User-Agent": "octopus-solar-dashboard/1.0 (personal local tool)", **(headers or {})})
+    try:
+        with urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except HTTPError as e:
+        raise ApiError(502, "Lookup failed (%s)" % e.code)
+    except (URLError, OSError, ValueError) as e:
+        raise ApiError(502, "Lookup failed: %s" % getattr(e, "reason", e))
+
+
+def geo_cache(key, fn):
+    """Answers are remembered in memory and in property.json."""
+    with LOCK:
+        if not GEO_MEM and PROPERTY_FILE.exists():
+            try:
+                GEO_MEM.update(json.loads(PROPERTY_FILE.read_text()))
+            except ValueError:
+                pass
+        if key in GEO_MEM:
+            return GEO_MEM[key]
+    value = fn()
+    with LOCK:
+        GEO_MEM[key] = value
+        if len(GEO_MEM) > 200:
+            GEO_MEM.pop(next(iter(GEO_MEM)))
+        PROPERTY_FILE.write_text(json.dumps(GEO_MEM))
+    return value
+
+
+def tidy_postcode(pc):
+    pc = re.sub(r"\s+", "", (pc or "").upper())
+    return pc[:-3] + " " + pc[-3:] if len(pc) > 3 else pc
+
+
+def geocode(text):
+    """Place a postcode or an address on the map: {lat, lon, label, source}."""
+    text = " ".join((text or "").split())
+    if not text or len(text) > 200:
+        raise ApiError(400, "Enter a postcode or an address.")
+    pc = tidy_postcode(text)
+
+    def run():
+        if POSTCODE_RE.match(pc):
+            try:
+                r = ext_json(POSTCODES + quote(pc.replace(" ", "")))["result"]
+                return {"lat": r["latitude"], "lon": r["longitude"], "label": pc, "source": "postcode"}
+            except (ApiError, KeyError, TypeError):
+                pass
+        hits = ext_json(NOMINATIM + "?" + urlencode({"q": text, "format": "jsonv2", "limit": 1, "countrycodes": "gb"}))
+        if not hits:
+            raise ApiError(404, "Could not find that place. Try the postcode.")
+        h = hits[0]
+        return {"lat": float(h["lat"]), "lon": float(h["lon"]), "label": h.get("display_name", text), "source": "address"}
+    return geo_cache("geo:" + text.upper(), run)
+
+
+def account_address(cfg):
+    acct = api_get("%s/accounts/%s/" % (API, cfg["account"]), cfg["apiKey"])
+    props = acct.get("properties", [])
+    props = [p for p in props if not p.get("moved_out_at")] or props
+    if not props:
+        raise ApiError(404, "No property found on this account.")
+    p = props[0]
+    lines = [p.get(k) for k in ("address_line_1", "address_line_2", "address_line_3", "town", "county")]
+    return {"lines": [x for x in lines if x], "postcode": tidy_postcode(p.get("postcode"))}
+
+
+def property_info(cfg):
+    """The account's address and where it is. If the address cannot be placed, fall back to the postcode."""
+    addr = account_address(cfg)
+    place = None
+    try:
+        place = geocode(", ".join(addr["lines"] + [addr["postcode"]]))
+    except ApiError:
+        pass
+    if (not place or place["source"] != "address") and POSTCODE_RE.match(addr["postcode"] or ""):
+        try:
+            place = geocode(addr["postcode"])
+        except ApiError:
+            pass
+    if not place:
+        raise ApiError(404, "Could not place your address on the map. Search for your postcode instead.")
+    return {"address": ", ".join(addr["lines"] + [addr["postcode"]]), "postcode": addr["postcode"], **place}
+
+
+def building_at(lat, lon):
+    """The single building at a point, from Nominatim. A slower-to-scale but more reliable fallback for Overpass."""
+    def run():
+        d = ext_json(NOMINATIM_REV + "?" + urlencode({"lat": "%.6f" % lat, "lon": "%.6f" % lon, "zoom": 18, "format": "jsonv2",
+                                                      "polygon_geojson": 1, "addressdetails": 0}))
+        g = d.get("geojson") or {}
+        if d.get("category") != "building" or g.get("type") != "Polygon":
+            return []
+        pts = [[y, x] for x, y in g["coordinates"][0]]
+        if len(pts) > 1 and pts[0] == pts[-1]:
+            pts.pop()
+        return [{"id": int(d.get("osm_id") or 0), "poly": pts, "tags": {}}] if len(pts) >= 3 else []
+    return geo_cache("bat:%.5f:%.5f" % (lat, lon), run)
+
+
+BUILDING_TAGS = ("building", "building:levels", "height", "roof:shape", "roof:orientation", "roof:direction", "roof:angle",
+                 "roof:levels", "addr:housenumber")
+
+
+def buildings_osm_api(lat, lon, radius):
+    """Every building way in a small box, from the OpenStreetMap map API: fast and reliable, and it includes buildings with no address."""
+    dl, dn = radius / 111320.0, radius / (111320.0 * math.cos(math.radians(lat)))
+    data = ext_json("https://api.openstreetmap.org/api/0.6/map.json?bbox=%.6f,%.6f,%.6f,%.6f" % (lon - dn, lat - dl, lon + dn, lat + dl))
+    nodes = {e["id"]: (e["lat"], e["lon"]) for e in data.get("elements", []) if e["type"] == "node"}
+    out = []
+    for e in data.get("elements", []):
+        if e["type"] != "way" or "building" not in e.get("tags", {}):
+            continue
+        ids = e.get("nodes", [])
+        if len(ids) > 1 and ids[0] == ids[-1]:
+            ids = ids[:-1]
+        pts = [list(nodes[i]) for i in ids if i in nodes]
+        if len(pts) >= 3:
+            out.append({"id": e["id"], "poly": pts, "tags": {k: v for k, v in e["tags"].items() if k in BUILDING_TAGS}})
+    out.sort(key=lambda b: min(abs(p[0] - lat) + abs(p[1] - lon) for p in b["poly"]))
+    return out[:80]
+
+
+def buildings_overpass(lat, lon, radius):
+    q = '[out:json][timeout:20];way["building"](around:%d,%.6f,%.6f);out geom tags;' % (radius, lat, lon)
+    body = urlencode({"data": q}).encode()
+    last = None
+    for url in OVERPASS:
+        try:
+            data = ext_json(url, body, timeout=12)
+            break
+        except ApiError as e:
+            last = e
+    else:
+        raise last
+    out = []
+    for el in data.get("elements", []):
+        pts = [[g["lat"], g["lon"]] for g in el.get("geometry", [])]
+        if len(pts) > 1 and pts[0] == pts[-1]:
+            pts.pop()
+        if len(pts) >= 3:
+            out.append({"id": el["id"], "poly": pts, "tags": {k: v for k, v in el.get("tags", {}).items() if k in BUILDING_TAGS}})
+    return out[:80]
+
+
+def buildings(lat, lon, radius=70):
+    """Building outlines around a point, from OpenStreetMap, with any roof tags people have added."""
+    def run():
+        try:
+            return buildings_osm_api(lat, lon, radius)
+        except ApiError:
+            return buildings_overpass(lat, lon, radius)
+    return geo_cache("bld2:%.4f:%.4f:%d" % (lat, lon, radius), run)
 
 
 # -------------------------------------------------------------- demo data ----
@@ -322,9 +517,10 @@ def demo_data(days):
             load += chunk
         out.append([ms(t), round(load, 3)])
         t += timedelta(minutes=30)
-    return {"meta": {"demo": True, "account": "DEMO", "tariffs": [], "warnings": [],
+    return {"meta": {"demo": True, "account": "DEMO", "ev": True, "tariffs": [], "warnings": [],
                      "fetchedAt": ms(datetime.now(timezone.utc))},
-            "consumption": out, "rates": [], "day": [], "night": [], "standing": [], "history": []}
+            "consumption": out, "rates": [], "day": [[out[0][0], None, 30.5]], "night": [[out[0][0], None, 7.0]],
+            "standing": [[out[0][0], None, 46.0]], "history": []}
 
 
 # ------------------------------------------------------------------ cache ----
@@ -332,7 +528,7 @@ def demo_data(days):
 def get_data(cfg, days, demo, refresh):
     if demo:
         return demo_data(days)
-    cache_key = "v3:%s:%d" % (cfg["account"], days)
+    cache_key = "v4:%s:%d" % (cfg["account"], days)
     with LOCK:
         if not refresh and CACHE_FILE.exists():
             try:
@@ -388,6 +584,8 @@ class Handler(BaseHTTPRequestHandler):
             here = is_loopback(self.client_address[0])
             return self._send(200, {"configured": ok, "account": cfg.get("account") if ok else None,
                                     "keyHint": cfg["apiKey"][-4:] if ok and here else None})
+        if url.path in ("/api/property", "/api/geocode", "/api/buildings"):
+            return self._place(url)
         if url.path == "/api/data":
             q = parse_qs(url.query)
             try:
@@ -403,6 +601,33 @@ class Handler(BaseHTTPRequestHandler):
             except ApiError as e:
                 return self._send(e.status, {"error": e.message})
         return self._static(url.path)
+
+    def _place(self, url):
+        q = parse_qs(url.query)
+        try:
+            if url.path == "/api/geocode":
+                return self._send(200, geocode(q.get("q", [""])[0]))
+            if url.path == "/api/buildings":
+                lat, lon = float(q["lat"][0]), float(q["lon"][0])
+                if not (49 <= lat <= 61 and -9 <= lon <= 2.5):
+                    raise ApiError(400, "That is outside the UK.")
+                if q.get("at", ["0"])[0] == "1":
+                    return self._send(200, {"buildings": building_at(lat, lon)})
+                radius = max(20, min(150, int(q.get("radius", ["70"])[0])))
+                return self._send(200, {"buildings": buildings(lat, lon, radius)})
+            if q.get("demo", ["0"])[0] == "1":
+                return self._send(200, DEMO_PLACE)
+            cfg = load_config()
+            if not (cfg.get("apiKey") and cfg.get("account")):
+                return self._send(401, {"error": "not_configured"})
+            key = "prop:" + cfg["account"]
+            if q.get("refresh", ["0"])[0] == "1":
+                GEO_MEM.pop(key, None)
+            return self._send(200, geo_cache(key, lambda: property_info(cfg)))
+        except (KeyError, ValueError):
+            return self._send(400, {"error": "Bad request"})
+        except ApiError as e:
+            return self._send(e.status, {"error": e.message})
 
     def do_POST(self):
         if not self._local_only():
@@ -431,9 +656,10 @@ class Handler(BaseHTTPRequestHandler):
                 CACHE_FILE.unlink()
             return self._send(200, {"ok": True})
         if path == "/api/disconnect":
-            for f in (CONFIG_FILE, CACHE_FILE):
+            for f in (CONFIG_FILE, CACHE_FILE, PROPERTY_FILE):
                 if f.exists():
                     f.unlink()
+            GEO_MEM.clear()
             return self._send(200, {"ok": True})
         self._send(404, {"error": "not found"})
 
