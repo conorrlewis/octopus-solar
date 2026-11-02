@@ -171,7 +171,7 @@ const Planner = (() => {
       tile('Energy bill a year', `${gbp(last.billBefore)} → ${gbp(after)}`, `${last.billBefore > 0 ? nf(last.y1 / last.billBefore * 100, 0) : 0}% lower (unit rates, before standing charge${after < 0 ? '; negative = export income exceeds your bill' : ''})`) +
       tile('Saved over 25 years', gbp(last.total), 'With panel and battery fade and your price trend') +
       tile('Solar generated', `${nf(last.gen, 0)}<small>kWh a year</small>`, `${pct(last.selfPct)} used at home, the rest exported`) +
-      tile('Usage covered', pct(last.covered), 'of your home use now met by solar and battery') +
+      tile('Usage covered', pct(last.covered), `of your ${SCOPE[S.scope][0]} met by solar and battery · panels generate ${pct(last.genShare)} of it`) +
       (cost > 0 ? tile('Payback', priced ? (pay === null ? '—' : `${nf(pay, 1)}<small>years</small>`) : '—',
         !priced ? 'Your price is for a different system' : pay === null ? 'Not within 25 years' : `Net ${gbp(net)} after 25 years on ${gbp(cost)}`) : tile('Payback', '—', 'Enter your installer\'s price below'));
     q('#pCostBox').hidden = !priced;

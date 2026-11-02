@@ -177,13 +177,13 @@ function evalDesign(faces, counts, cap, invKw, full) {
     let gen = 0; for (let i = 0; i < n; i++) { gs[i] = Math.min(raw[i] * kp, lim); gen += gs[i]; }
     const r = X.makeModel(gs)(cap * kb, c.gridCharge, c.batExport, kw, c.batEff, kw);
     let imp = 0, exp = 0, self = 0, cov = 0, bill = 0;
-    for (let i = 0; i < n; i++) { const d = X.load[i] - r.imp[i]; imp += d * X.prate[i]; cov += d; exp += r.exp[i]; self += r.self[i]; bill += X.load[i] * X.prate[i]; }
+    for (let i = 0; i < n; i++) { const d = X.load[i] - r.imp[i]; imp += d * X.prate[i]; cov += r.self[i] + r.bg[i]; exp += r.exp[i]; self += r.self[i]; bill += X.load[i] * X.prate[i]; }
     return { bill: bill / 100 * ann, imp: imp / 100 * ann, exp: exp * c.exportRate / 100 * ann, gen: gen * ann, self: self * ann, cov: cov * ann };
   });
   const lerp = (f, k) => { if (ks.length === 1) return f(pts[0]); let j = 0; while (j < ks.length - 2 && k > ks[j + 1]) j++; const t = (k - ks[j]) / (ks[j + 1] - ks[j]); return f(pts[j]) * (1 - t) + f(pts[j + 1]) * t; };
   const years = Array.from({ length: 25 }, (_, k) => lerp(p => p.imp, k) * Math.pow(1 + X.gU, k) + lerp(p => p.exp, k) * Math.pow(1 + X.gE, k));
   const p0 = pts[0], used = X.loadSum * ann;
-  return { years, y1: years[0], billBefore: p0.bill, total: years.reduce((a, v) => a + v, 0), gen: p0.gen, selfPct: p0.gen ? p0.self / p0.gen : 0, covered: used ? p0.cov / used : 0,
+  return { years, y1: years[0], billBefore: p0.bill, total: years.reduce((a, v) => a + v, 0), gen: p0.gen, selfPct: p0.gen ? p0.self / p0.gen : 0, covered: used ? p0.cov / used : 0, genShare: used ? p0.gen / used : 0,
     kwp: panels * c.panelW / 1000, panels, annual };
 }
 // Years until the savings add up to the cost (interpolated), or null if not within 25 years.
@@ -1046,7 +1046,7 @@ function seg(id, get, set) {
 }
 seg('#range', () => S.sel ? null : S.range, v => { S.sel = null; S.anchor = null; S.range = v; localStorage.setItem('octo.range', v); });
 seg('#group', () => S.group, v => { S.group = v; });
-seg('#scope', () => S.scope, v => { S.scope = v; localStorage.setItem('octo.scope', v); if (S.D) compute(); });
+seg('#scope', () => S.scope, v => { S.scope = v; localStorage.setItem('octo.scope', v); if (S.D) { compute(); Planner.changed(false); } });
 $('#refresh').onclick = () => loadData(true);
 $('#selChip').onclick = () => { S.sel = null; S.anchor = null; render(); };
 function applyTheme(t) { if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; }
